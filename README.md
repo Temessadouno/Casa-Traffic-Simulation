@@ -1,164 +1,37 @@
-Système de Simulation des Accidents Routiers avec Intelligence Artificielle
-Description du projet
+# 🚦 Simulation d'Accidents de Trafic par IA - Casablanca
 
-Ce projet vise à développer un système de simulation des accidents de la route intégrant des techniques d’intelligence artificielle.
-Il permet de générer des scénarios d’accidents et d’analyser les risques associés à l’aide de modèles de machine learning.
+Ce projet vise à simuler, analyser et prédire les congestions et risques d'accidents dans la ville de Casablanca en utilisant le moteur **SUMO** (Simulation of Urban MObility) et des modèles d'**Intelligence Artificielle**.
 
-L’objectif est d’améliorer la compréhension des causes des accidents et de contribuer à la prévention des risques routiers.
+## 🏗️ Architecture du Projet
 
-Objectifs
-Simuler des scénarios d’accidents routiers
-Modéliser le comportement des véhicules (vitesse, distance, collision)
-Intégrer un modèle d’intelligence artificielle
-Prédire les risques d’accident
-Fournir un outil d’analyse simple et interactif
-Architecture du système
+Le projet suit une architecture micro-services orchestrée par **Docker** :
+*   **Backend** : API FastAPI (Python) gérant la logique de simulation (TraCI) et l'IA.
+*   **Frontend** : Interface React pour la visualisation cartographique du trafic.
+*   **Base de données** : MongoDB pour le stockage des logs de trafic en temps réel.
 
-Le système est composé de trois modules principaux :
+## 🛠️ Technologies Utilisées
+*   **Simulation** : SUMO, TraCI.
+*   **Backend** : FastAPI, Motor (Async MongoDB), Pydantic.
+*   **IA** : Modèles de prédiction (DCRNN / Inférence Bayésienne).
+*   **DevOps** : Docker, Docker-Compose.
+*   **Cartographie** : OpenStreetMap (OSM) pour Casablanca.
 
-Module de simulation : génération des scénarios d’accidents
-Module IA : analyse et prédiction des risques
-Interface utilisateur : interaction avec le système
-Technologies utilisées
-
-Backend :
-
-Python
-Flask ou FastAPI
-Scikit-learn ou TensorFlow
-
-Frontend :
-
-React.js ou HTML/CSS/JavaScript
-
-Données :
-
-Fichiers CSV
-Installation
-Cloner le projet
-git clone https://github.com/votre-utilisateur/simulation-accidents-ia.git
-cd simulation-accidents-ia
-Backend
-cd backend
-pip install -r requirements.txt
-python app.py
-Frontend
-cd frontend
-npm install
-npm start
-Fonctionnement
-L’utilisateur saisit les paramètres (vitesse, distance, conditions)
-Le système simule un scénario d’accident
-Le module IA analyse les données
-Le système retourne un niveau de risque :
-Faible
-Moyen
-Élevé
-Modèle d’intelligence artificielle
-
-Le modèle est basé sur des variables telles que :
-
-Vitesse
-Distance
-Conditions de circulation
-Environnement
-
-Algorithmes possibles :
-
-Random Forest
-Régression logistique
-Structure du projet
-
-Voir l’arborescence ci-dessus.
-
-Améliorations futures
-Simulation 3D
-Intégration de données réelles
-Modèles de deep learning
-Application mobile
-Auteur
-
-TEMESSADOUNO Tamba Marcel
-FST Mohammedia – Filière ILISI 2
-
-
-
-structure du projet
+## 📁 Structure des Dossiers
+```text
 simulation-accidents-ia/
-│
-├── backend/
-│   │
-│   ├── app/
-│   │   ├── __init__.py
-│   │   │
-│   │   ├── api/
-│   │   │   ├── __init__.py
-│   │   │   ├── routes/
-│   │   │   │   ├── simulation_routes.py
-│   │   │   │   ├── ia_routes.py
-│   │   │   │   └── health_routes.py
-│   │   │   │
-│   │   │   └── schemas/
-│   │   │       ├── simulation_schema.py
-│   │   │       └── ia_schema.py
-│   │   │
-│   │   ├── core/
-│   │   │   ├── config.py
-│   │   │   └── settings.py
-│   │   │
-│   │   ├── simulation/
-│   │   │   ├── __init__.py
-│   │   │   ├── engine.py
-│   │   │   ├── physics.py
-│   │   │   └── scenarios.py
-│   │   │
-│   │   ├── ia/
-│   │   │   ├── __init__.py
-│   │   │   ├── model.py
-│   │   │   ├── train.py
-│   │   │   └── predict.py
-│   │   │
-│   │   ├── services/
-│   │   │   ├── simulation_service.py
-│   │   │   └── ia_service.py
-│   │   │
-│   │   ├── models/
-│   │   │   └── (structures de données si besoin)
-│   │   │
-│   │   └── utils/
-│   │       ├── logger.py
-│   │       └── helpers.py
-│   │
-│   ├── data/
-│   │   ├── raw/
-│   │   ├── processed/
-│   │   └── datasets/
-│   │
-│   ├── notebooks/
-│   │   └── exploration.ipynb
-│   │
-│   ├── tests/
-│   │   ├── test_simulation.py
-│   │   ├── test_ia.py
-│   │   └── test_api.py
-│   │
-│   ├── requirements.txt
-│   ├── main.py
-│   └── README.md
-│
-├── frontend/
-│   ├── public/
-│   └── src/
-│       ├── components/
-│       ├── pages/
-│       ├── services/
-│       └── utils/
-│
-├── docs/
-│   ├── architecture/
-│   ├── uml/
-│   └── diagrams/
-│
-├── .gitignore
-├── README.md
-└── LICENSE
+├── backend/            # Code source Python (FastAPI + SUMO)
+│   ├── data/           # Fichiers OSM et configurations de Casablanca
+│   ├── src/            # Logique API et Database
+│   └── simulation/     # Moteur de simulation (engine.py)
+├── frontend/           # Interface utilisateur (React)
+├── docs/               # Documentation UML et architecture
+└── docker-compose.yml  # Orchestration des conteneurs
+
+
+//Les commandes du docker-compose
+
+---Construistion des images et conteneur
+>>>>>> docker-compose up --build
+
+---- Intallation des bibliothèque pour la génération de fichier .png
+>>>> docker exec -it -u root backend_sim pip install matplotlib

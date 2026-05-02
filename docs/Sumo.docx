@@ -1,0 +1,149 @@
+📄 DOCUMENT TECHNIQUE : SUMO pour la simulation des accidents à Casablanca
+Projet : Simulation des Accidents et Intégration IA
+Ville : Casablanca, Maroc
+Auteur : [Votre Nom]
+Date : Avril 2026
+
+1. Qu'est-ce que SUMO ?
+SUMO (Simulation of Urban MObility) est un moteur de simulation de trafic open-source, multi-modal et microscopique.
+
+En tant qu'étudiant en Génie Logiciel, vous pouvez le voir comme un "bac à sable" physique où chaque véhicule, piéton ou feu de signalisation est une instance d'objet que vous pouvez piloter par code.
+
+🔗 Site officiel : https://www.eclipse.org/sumo/
+
+2. Ce que SUMO apporte à votre projet
+2.1. Modélisation Microscopique
+Contrairement à une simulation "macroscopique" qui regarde le flux global (comme un tuyau d'eau), SUMO gère chaque entité individuellement :
+
+Caractéristique	Description
+Comportement des conducteurs	Calcul de l'accélération, freinage et changement de voie en fonction des véhicules environnants
+Physique du véhicule	Prise en compte de la longueur, vitesse maximale et capacité de décélération
+Interactions	Gestion des priorités, dépassements, et réactions aux feux
+2.2. Gestion de la Carte (Réseau routier)
+SUMO transforme des données géographiques en un réseau de nœuds (intersections) et de liens (routes) :
+
+Source des données : OpenStreetMap (export de la région de Casablanca)
+
+Fichier généré : .net.xml (réseau routier exploitable par SUMO)
+
+Fonctionnalités :
+
+Gestion des priorités aux intersections
+
+Simulation des cycles des feux tricolores
+
+Prise en compte des sens uniques et limitations de vitesse
+
+2.3. Interactivité via TraCI (Le "Pont" Python)
+TraCI (Traffic Control Interface) est l'API qui permet à votre script Python de "parler" à SUMO pendant qu'il tourne. C'est la partie la plus importante pour votre backend FastAPI.
+
+Opération	Description
+Lecture	"Où se trouve le véhicule 'Casa_01' à l'étape 100 ?"
+Action	Forcer un véhicule à freiner brusquement pour simuler un accident
+Extraction	Récupérer données de trafic → stockage dans MongoDB → alimentation IA
+2.4. Génération de Données pour l'IA
+Dans votre stage, SUMO ne sert pas juste à "regarder" des voitures bouger. Il sert de générateur de dataset :
+
+Création de milliers de situations de trafic propres à Casablanca
+
+Extraction des vitesses, positions, densités
+
+Alimentation des modèles IA (comme Random Forest ou DCRNN)
+
+Apprentissage des schémas qui mènent à une congestion ou un accident
+
+3. Architecture technique
+3.1. Pipeline de données SUMO
+text
+OpenStreetMap (Casablanca)
+        ↓
+    netconvert (conversion)
+        ↓
+    fichier .net.xml (réseau)
+        ↓
+    duarouter / randomTrips.py (génération trafic)
+        ↓
+    fichier .rou.xml (routes & véhicules)
+        ↓
+    Configuration .sumocfg
+        ↓
+    SUMO ENGINE (simulation)
+        ↓
+    TraCI API (communication)
+        ↓
+    Backend FastAPI + MongoDB
+        ↓
+    Modèle IA (prédiction accidents)
+3.2. Outils SUMO utilisés dans votre projet
+Fonction	Outil SUMO	Rôle
+Créer la route	netconvert	OSM → .net.xml
+Créer le trafic	duarouter ou randomTrips.py	Génération des flux
+Exécuter	sumo (mode ligne de commande)	Lancement dans Docker
+Piloter/Extraire	TraCI	Communication avec Python
+4. Intégration avec votre stack technique
+4.1. Architecture Docker
+yaml
+services:
+  sumo-simulator:
+    image: sumo/sumo:latest
+    ports:
+      - "4040:4040"  # Port TraCI
+    volumes:
+      - ./sumo/maps:/home/sumo/maps
+      - ./sumo/scenarios:/home/sumo/scenarios
+4.2. Communication Backend ← → SUMO
+python
+# Exemple d'interaction avec TraCI
+import traci
+
+# Connexion au simulateur
+traci.connect(port=4040)
+
+# Récupérer la position d'un véhicule
+position = traci.vehicle.getPosition("vehicle_123")
+
+# Simuler un accident (forcer un arrêt brutal)
+traci.vehicle.setSpeed("vehicle_123", 0)
+
+# Stocker dans MongoDB
+db.accidents.insert_one({
+    "vehicle_id": "vehicle_123",
+    "position": position,
+    "timestamp": traci.simulation.getTime()
+})
+4.3. Variables d'environnement à configurer
+env
+SUMO_HOST=localhost
+SUMO_PORT=4040
+SUMO_HOME=/usr/share/sumo
+5. Types de données générées par SUMO
+Type de donnée	Format	Utilisation
+Positions GPS	(lat, lon)	Cartographie des accidents
+Vitesses	km/h	Détection anomalies
+Densité de trafic	véhicules/km	Prédiction congestion
+Temps de trajet	secondes	Évaluation impact accidents
+Émissions CO2	mg/s	Analyse environnementale
+6. Avantages de SUMO pour ce projet
+Avantage	Bénéfice pour Casablanca
+Open-source	Pas de licence, déploiement libre
+Microscopique	Précision au niveau de chaque véhicule
+TraCI	Contrôle temps réel depuis Python
+Grande scalabilité	Simulation de milliers de véhicules
+Multi-modal	Voitures, camions, piétons, bus
+Intégration Docker	Reproductibilité et déploiement facile
+7. Références utiles
+Ressource	Lien
+Documentation SUMO	https://sumo.dlr.de/docs/
+Tutoriel TraCI (Python)	https://sumo.dlr.de/docs/TraCI.html
+OpenStreetMap Casablanca	https://www.openstreetmap.org/#map=12/33.5731/-7.5898
+Exporter OSM pour SUMO	https://sumo.dlr.de/docs/Networks/Import/OpenStreetMap.html
+8. Conclusion
+SUMO est le cœur de votre simulateur d'accidents. Il permet de :
+
+✅ Modéliser fidèlement le trafic casablancais
+✅ Générer des données d'entraînement pour l'IA
+✅ Simuler des scénarios d'accidents en temps réel
+✅ Communiquer avec votre backend via TraCI
+✅ S'intégrer proprement dans votre architecture Docker
+
+💡 Pour la suite : Une fois SUMO opérationnel, vous pourrez connecter vos modèles IA (Random Forest, SARIMA, etc.) pour prédire les zones à risque avant même qu'un accident ne survienne.
