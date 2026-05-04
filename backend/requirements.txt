@@ -5,3 +5,7 @@ pydantic
 pydantic-settings
 pandas
 traci
+matplotlib
+sumolib
+contextily
+pyproj

@@ -1,21 +1,4 @@
 <?xml version="1.0" encoding="UTF-8"?>
-
-<!-- generated on 2026-04-30 18:50:28 by Eclipse SUMO netgenerate Version 1.18.0
-<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/netgenerateConfiguration.xsd">
-
-    <grid_network>
-        <grid value="true"/>
-        <grid.number value="10"/>
-        <grid.length value="100"/>
-    </grid_network>
-
-    <output>
-        <output-file value="data/test.net.xml"/>
-    </output>
-
-</configuration>
--->
-
 <net version="1.16" junctionCornerDetail="5" limitTurnSpeed="5.50" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
 
     <location netOffset="0.00,0.00" convBoundary="0.00,0.00,900.00,900.00" origBoundary="0.00,0.00,900.00,900.00" projParameter="!"/>
