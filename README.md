@@ -296,5 +296,4 @@ git commit -m "feat: ajout heatmap zones à risque"
 
 ## Licence
 
-Projet académique — Université / École d'ingénieurs, Casablanca.  
-Usage interne uniquement.
+Projet de Stage ILISI 2ème Année.
