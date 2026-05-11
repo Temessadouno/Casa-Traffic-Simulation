@@ -1,11 +1,16 @@
+version: "3.9"
+
 services:
+
   mongodb:
-    image: mongo:latest
+    image: mongo:6
     container_name: mongodb_casa
     ports:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    networks:
+      - sim_net
 
   mongo-express:
     image: mongo-express
@@ -14,27 +19,54 @@ services:
     ports:
       - "8081:8081"
     environment:
-      - ME_CONFIG_MONGODB_SERVER=mongodb
-      - ME_CONFIG_MONGODB_PORT=27017
-      - ME_CONFIG_BASICAUTH_USERNAME=admin
-      - ME_CONFIG_BASICAUTH_PASSWORD=pass
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: pass
     depends_on:
       - mongodb
+    networks:
+      - sim_net
 
   backend:
     build: ./backend
     container_name: backend_sim
     ports:
       - "8000:8000"
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000
     depends_on:
       - mongodb
-    # On privilégie le fichier .env pour garder le docker-compose propre
+    environment:
+      PYTHONUNBUFFERED: 1
+      PYTHONPATH: /app
+      SUMO_HOME: /usr/share/sumo
+      MONGO_URI: mongodb://mongodb:27017
     env_file:
       - ./backend/.env
     volumes:
       - ./backend:/app
-      - /usr/local/lib/python3.10/site-packages
+      - ./backend/data:/app/data
+    restart: unless-stopped
+    networks:
+      - sim_net
 
+  frontend:
+    build: ./frontend
+    container_name: frontend_sim
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    restart: unless-stopped
+    networks:
+      - sim_net
 
 volumes:
   mongo_data:
+
+networks:
+  sim_net:
+    driver: bridge

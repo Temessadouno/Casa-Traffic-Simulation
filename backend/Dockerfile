@@ -1,23 +1,31 @@
-FROM python:3.10-slim
+FROM ubuntu:22.04
 
-# Installation des dépendances système pour SUMO
-RUN apt-get update && apt-get install -y \
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt update && apt install -y \
+    python3 \
+    python3-pip \
     sumo \
     sumo-tools \
-    libxerces-c-dev \
+    wget \
+    curl \
+    nano \
+    libglib2.0-0 \
+    libx11-6 \
+    libgl1 \
+    && apt clean \
     && rm -rf /var/lib/apt/lists/*
 
 ENV SUMO_HOME=/usr/share/sumo
+ENV PATH="$PATH:$SUMO_HOME/tools"
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# On copie tout le contenu du dossier backend dans /app
 COPY . .
 
 EXPOSE 8000
 
-# On lance l'API depuis le dossier src
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

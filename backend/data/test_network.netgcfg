@@ -1,9 +1,0 @@
-<configuration>
-   <grid-network>
-       <grid.number value="5"/>
-       <grid.length value="200"/>
-   </grid-network>
-   <output>
-       <output-file value="test.net.xml"/>
-   </output>
-</configuration>
