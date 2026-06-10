@@ -1,5 +1,5 @@
 // frontend/src/App.js
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import Sidebar from './components/layout/Sidebar';
 import Navbar from './components/layout/Navbar';
 import Footer from './components/layout/Footer';
@@ -12,23 +12,17 @@ const App = () => {
   const [activeScreen, setActiveScreen] = useState('map-solo');
 
   return (
-    <div className="flex h-screen bg-black text-slate-100 font-mono overflow-hidden">
-      {/* Aside Bar - Style Cockpit */}
+    <div className="flex h-screen bg-white text-gray-800">
       <Sidebar setActiveScreen={setActiveScreen} activeScreen={activeScreen} />
 
       <div className="flex flex-col flex-1">
-        {/* Navbar - Logo & Auth */}
         <Navbar />
-
-        {/* Écran Principal Dynamique */}
-        <main className="flex-1 relative overflow-hidden bg-slate-900/50">
+        <main className="flex-1 relative overflow-hidden bg-gray-50">
           {activeScreen === 'map-solo' && <MapSolo />}
           {activeScreen === 'map-global' && <MapGlobal />}
           {activeScreen === 'diagnostic' && <Diagnostic />}
           {activeScreen === 'historique' && <Historique />}
         </main>
-
-        {/* Footer - Temps réel */}
         <Footer />
       </div>
     </div>

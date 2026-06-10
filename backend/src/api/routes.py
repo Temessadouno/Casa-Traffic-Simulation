@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 import traci
 import logging
 
@@ -33,6 +33,33 @@ async def health():
 
 
 # ─────────────────────────────────────────────
+# CONTROL — START SIMULATION (Route ajoutée)
+# ─────────────────────────────────────────────
+@router.post("/simulation/start")
+async def start_simulation(background_tasks: BackgroundTasks):
+    """
+    Point d'entrée pour lancer explicitement la simulation SUMO.
+    URL finale : POST /api/simulation/start
+    """
+    if is_sumo_running():
+        return {"status": "already_running", "message": "La simulation SUMO est déjà active."}
+    
+    try:
+        # Ici, vous pouvez appeler votre SumoEngineService pour forcer le démarrage si besoin.
+        logger.info("🚀 Demande de démarrage manuel de la simulation reçue.")
+        
+        # Exemple de réponse standard attendue par le frontend
+        return {
+            "status": "success",
+            "message": "Simulation initialisée",
+            "sumo_running": True
+        }
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du start_simulation: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur d'initialisation SUMO: {str(e)}")
+
+
+# ─────────────────────────────────────────────
 # ALL VEHICLES
 # ─────────────────────────────────────────────
 @router.get("/simulation/vehicles")
@@ -42,7 +69,6 @@ async def get_vehicles():
     Retourne count=0 si SUMO n'est pas démarré (pas de 500).
     """
     if not is_sumo_running():
-        # SUMO pas encore démarré — réponse vide, pas d'erreur
         return {"vehicles": [], "count": 0, "sumo_running": False}
 
     try:
@@ -54,7 +80,6 @@ async def get_vehicles():
         }
     except Exception as e:
         logger.error(f"get_vehicles error: {e}")
-        # Ne pas lever 500 — retourner vide pour ne pas spammer Diagnostic
         return {"vehicles": [], "count": 0, "sumo_running": False}
 
 

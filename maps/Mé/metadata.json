@@ -1,0 +1,21 @@
+{
+  "scenario_id": "M\u00e9",
+  "generated_at": "2026-06-10T09:49:24.128420",
+  "bbox": {
+    "min_lat": 33.71152474631203,
+    "max_lat": 33.71934242921533,
+    "min_lng": -7.3389530181884775,
+    "max_lng": -7.327108383178712
+  },
+  "vehicle_count": 300,
+  "pedestrian_count": 5,
+  "accident_count": 1,
+  "sim_duration_s": 3600,
+  "network_method": "osm",
+  "deployed_files": [
+    "casa.net.xml",
+    "casa.rou.xml",
+    "casa.sumocfg"
+  ],
+  "scenario_name": "M\u00e9"
+}
