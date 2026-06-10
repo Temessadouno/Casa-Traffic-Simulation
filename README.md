@@ -1,6 +1,6 @@
 # TMT Traffic Control — Casablanca
 
-Plateforme de simulation intelligente du trafic urbain de Casablanca, développée dans le cadre d'un projet de fin d'études à l'ENSA Casablanca (ValléEducation).
+Plateforme de simulation intelligente du trafic urbain de Casablanca, développée dans le cadre d'un projet de fin d'Année à la FST de Mohammedia.
 
 Elle couple un moteur de simulation microscopique (SUMO/TraCI), une API temps réel (FastAPI + Socket.IO), une base de données de trajectoires (MongoDB) et une interface web interactive (React).
 
