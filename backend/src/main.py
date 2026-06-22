@@ -169,10 +169,6 @@ lstm_training  = False
 if lstm_predictor:
     logger.info("✅ LSTMPredictorService initialisé")
 
-# ── Queue métriques (non-bloquant) ──────────────────────────────────────────
-# La boucle broadcast pousse ici, un worker séparé écrit en MongoDB
-_metrics_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
-
 # ============================================================
 # 4. SUMO CONFIG + ÉTAT GLOBAL
 # ============================================================
@@ -349,38 +345,6 @@ async def broadcast_nearby_vehicles(ego_id: str, sid: str):
 # 6. BOUCLE DE BROADCAST
 # ============================================================
 
-async def _metrics_writer():
-    """
-    Worker séparé qui consomme la queue de métriques et écrit en MongoDB.
-    Tourne en arrière-plan sans jamais bloquer la boucle broadcast.
-    Traite par batch de 50 pour réduire les round-trips MongoDB.
-    """
-    logger.info("📊 Worker métriques démarré")
-    batch = []
-    while True:
-        try:
-            # Attendre un élément (timeout 2s pour flush le batch partiel)
-            try:
-                item = await asyncio.wait_for(_metrics_queue.get(), timeout=2.0)
-                batch.append(item)
-                # Drainer le reste disponible immédiatement (sans attente)
-                while not _metrics_queue.empty() and len(batch) < 50:
-                    batch.append(_metrics_queue.get_nowait())
-            except asyncio.TimeoutError:
-                pass  # Flush le batch partiel
-
-            if batch and persistence:
-                for metric in batch:
-                    try:
-                        await persistence.save_traffic_metrics(metric)
-                    except Exception as e:
-                        logger.debug(f"metrics write error: {e}")
-                batch.clear()
-        except Exception as e:
-            logger.debug(f"_metrics_writer error: {e}")
-            await asyncio.sleep(1)
-
-
 async def simulation_broadcast_loop():
     global SUMO_RUNNING, ACTIVE_JOURNEY_ID
     logger.info("🔄 Boucle broadcast démarrée")
@@ -548,7 +512,7 @@ async def simulation_broadcast_loop():
                     try:
                         metrics = sumo_engine.collect_traffic_metrics()
                         for metric in metrics.values():
-                            # Push LSTM (synchrone, non bloquant)
+                            # Push LSTM (pas de DB — non bloquant)
                             if lstm_predictor:
                                 lstm_predictor.push_metrics(metric.segment_id, {
                                     "average_speed": metric.average_speed,
@@ -556,12 +520,13 @@ async def simulation_broadcast_loop():
                                     "density":       metric.density,
                                     "occupancy":     metric.occupancy,
                                 })
-                            # Détecter anomalies (synchrone, non bloquant)
                             anomaly = sumo_engine.detect_anomalies(metric)
                             if anomaly:
-                                asyncio.create_task(
-                                    persistence.save_anomaly(ACTIVE_JOURNEY_ID, anomaly)
-                                ) if persistence else None
+                                # Sauvegarder anomalie en fire-and-forget (pas d'await bloquant)
+                                if persistence:
+                                    asyncio.create_task(
+                                        persistence.save_anomaly(ACTIVE_JOURNEY_ID, anomaly)
+                                    )
                                 await sio.emit("road_alert", {
                                     "segment_id":    anomaly.segment_id,
                                     "severity":      anomaly.severity,
@@ -572,12 +537,14 @@ async def simulation_broadcast_loop():
                                     "risk_level":    anomaly.severity,
                                     "timestamp":     datetime.utcnow().isoformat(),
                                 })
-                            # Pousser TOUTES les métriques dans la queue → worker écrit en MongoDB
-                            # Non-bloquant : put_nowait ignore si queue pleine (pas de backpressure)
-                            try:
-                                _metrics_queue.put_nowait(metric)
-                            except asyncio.QueueFull:
-                                pass  # Queue pleine → on skip, pas de blocage
+                        # Sauvegarder métriques en batch toutes les 100 steps (fire-and-forget)
+                        if step_counter % 100 == 0 and persistence:
+                            batch = list(metrics.values())[:20]  # max 20 segments
+                            async def _save_batch(b):
+                                for m in b:
+                                    try: await persistence.save_traffic_metrics(m)
+                                    except: pass
+                            asyncio.create_task(_save_batch(batch))
                     except Exception as metrics_err:
                         logger.debug(f"metrics error: {metrics_err}")
 
@@ -666,8 +633,7 @@ async def startup_db_client():
         logger.warning("⚠️ MongoDB non configuré")
 
     asyncio.create_task(simulation_broadcast_loop())
-    asyncio.create_task(_metrics_writer())
-    logger.info("✅ Boucle broadcast + worker métriques planifiés")
+    logger.info("✅ Boucle broadcast planifiée")
 
 
 @fastapi_app.on_event("shutdown")

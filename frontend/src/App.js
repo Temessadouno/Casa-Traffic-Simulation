@@ -7,6 +7,7 @@ import MapSolo from './components/screens/MapSolo';
 import MapGlobal from './components/screens/MapGlobal';
 import Diagnostic from './components/screens/Diagnostic';
 import Historique from './components/screens/Historique';
+import PredictionPage from "./components/screens/PredictionPage";
 
 const App = () => {
   const [activeScreen, setActiveScreen] = useState('map-solo');
@@ -22,6 +23,7 @@ const App = () => {
           {activeScreen === 'map-global' && <MapGlobal />}
           {activeScreen === 'diagnostic' && <Diagnostic />}
           {activeScreen === 'historique' && <Historique />}
+          {activeScreen === 'prediction' && <PredictionPage />}
         </main>
         <Footer />
       </div>

@@ -93,6 +93,13 @@ class SocketService {
     this.socket.on('road_alert',           (d) => this._emit('road_alert', d));
     this.socket.on('accident_alert',       (d) => this._emit('accident_alert', d));
     this.socket.on('collision_risk_alert', (d) => this._emit('collision_risk_alert', d));
+
+    // ── LSTM ───────────────────────────────────────────────────────
+    this.socket.on('lstm_predictions',  (d) => this._emit('lstm_predictions', d));
+    this.socket.on('lstm_train_status', (d) => this._emit('lstm_train_status', d));
+
+    // ── Accidents ──────────────────────────────────────────────────
+    this.socket.on('accidents_state',   (d) => this._emit('accidents_state', d));
   }
 
   // ── Abonnements ────────────────────────────────────────────────────

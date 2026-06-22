@@ -38,6 +38,7 @@ services:
       PYTHONUNBUFFERED: 1
       PYTHONPATH: /app
       SUMO_HOME: /usr/share/sumo
+      SUMO_DATA_DIR: /app/src/maps
       MONGO_URI: mongodb://mongodb:27017   # ⚠️ Utilise le nom du SERVICE
     env_file:
       - ./backend/.env

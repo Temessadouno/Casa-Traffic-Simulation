@@ -27,6 +27,12 @@ const Sidebar = ({ activeScreen, setActiveScreen }) => {
       label: 'Historique',
       sub: 'Trajets enregistrés',
     },
+    {
+      id: 'prediction',
+      icon: <Map size={20} />,
+      label: 'Prédiction',
+      sub: 'Prédiction de LSTM',
+    },
   ];
 
   return (
