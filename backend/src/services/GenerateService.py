@@ -1,22 +1,13 @@
 # src/services/GenerateService.py
 """
-Service de génération de scénarios SUMO.
+Service de génération de scénarios SUMO — VERSION CORRIGÉE
 
-Fonctionnement complet :
-  1. Télécharge les données OSM depuis Overpass API (bbox)
-  2. Convertit le réseau OSM → SUMO via netconvert
-  3. Fallback : réseau synthétique via netgenerate
-  4. Génère les routes véhicules via randomTrips.py
-  5. Génère les piétons (optionnel)
-  6. Injecte les accidents comme véhicules bloqués
-  7. Produit le .sumocfg complet
-  8. Déploie tout dans le dossier cible (remplace les fichiers existants)
-
-Le dossier de sortie est :
-  <SUMO_DATA_DIR>/generated_<timestamp>/   (sauvegardé)
-  <SUMO_DATA_DIR>/casa.net.xml             (lien actif)
-  <SUMO_DATA_DIR>/casa.rou.xml
-  <SUMO_DATA_DIR>/casa.sumocfg
+Corrections appliquées :
+  FIX 1 — randomTrips : supprimer --edge-permission passenger (trop restrictif OSM)
+  FIX 2 — injection sur toute la durée sim + flows continus (pas juste 60s)
+  FIX 3 — validation duarouter : vérifier que le fichier contient des <vehicle>
+  FIX 4 — sumocfg : step-length 0.1 pour fluidité maximale
+  FIX 5 — _generate_minimal_routes : flows plus denses et mieux répartis
 """
 
 import os
@@ -32,12 +23,7 @@ from typing import List, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────
-# HELPERS INTERNES
-# ──────────────────────────────────────────────────────────────
-
 def _find_random_trips() -> Optional[str]:
-    """Localise randomTrips.py dans l'installation SUMO."""
     candidates = [
         "/usr/share/sumo/tools/randomTrips.py",
         "/usr/local/share/sumo/tools/randomTrips.py",
@@ -51,10 +37,6 @@ def _find_random_trips() -> Optional[str]:
 
 
 def _download_osm(bbox: Dict, dest: str, timeout: int = 90) -> bool:
-    """
-    Télécharge les données OSM depuis Overpass API.
-    Retourne True si le téléchargement a réussi.
-    """
     url = (
         f"https://overpass-api.de/api/map?"
         f"bbox={bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}"
@@ -66,14 +48,13 @@ def _download_osm(bbox: Dict, dest: str, timeout: int = 90) -> bool:
             f.write(resp.read())
         size = os.path.getsize(dest)
         logger.info(f"✅ OSM téléchargé : {size:,} bytes")
-        return size > 500  # fichier vide = zone hors couverture
+        return size > 500
     except Exception as e:
         logger.warning(f"⚠️ Téléchargement OSM échoué : {e}")
         return False
 
 
 def _netconvert_osm(osm_path: str, net_file: str, timeout: int = 120) -> bool:
-    """Convertit un fichier OSM en réseau SUMO via netconvert."""
     result = subprocess.run(
         [
             "netconvert",
@@ -97,16 +78,14 @@ def _netconvert_osm(osm_path: str, net_file: str, timeout: int = 120) -> bool:
 
 
 def _netgenerate_grid(net_file: str, bbox: Dict, timeout: int = 60) -> bool:
-    """Génère un réseau en grille synthétique via netgenerate."""
     dlat = abs(bbox["max_lat"] - bbox["min_lat"])
     dlng = abs(bbox["max_lng"] - bbox["min_lng"])
-    grid_x = max(3, min(12, int(dlng * 100)))
-    grid_y = max(3, min(12, int(dlat * 100)))
+    grid_x = max(5, min(15, int(dlng * 100)))
+    grid_y = max(5, min(15, int(dlat * 100)))
 
     result = subprocess.run(
         [
-            "netgenerate",
-            "--grid",
+            "netgenerate", "--grid",
             f"--grid.x-number={grid_x}",
             f"--grid.y-number={grid_y}",
             "--grid.x-length=150",
@@ -124,6 +103,19 @@ def _netgenerate_grid(net_file: str, bbox: Dict, timeout: int = 60) -> bool:
     return ok
 
 
+def _rou_has_vehicles(path: str, min_count: int = 5) -> bool:
+    """Vérifie qu'un fichier .rou.xml contient au moins min_count véhicules ou flows."""
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < 100:
+            return False
+        tree = ET.parse(path)
+        root = tree.getroot()
+        vehicles = root.findall(".//vehicle") + root.findall(".//flow") + root.findall(".//trip")
+        return len(vehicles) >= min_count
+    except Exception:
+        return False
+
+
 def _generate_routes_random_trips(
     random_trips: str,
     net_file: str,
@@ -135,119 +127,105 @@ def _generate_routes_random_trips(
     timeout: int = 120,
 ) -> bool:
     """
-    Lance randomTrips.py pour générer des routes valides.
-    Stratégie : d'abord avec --validate (duarouter intégré),
-    puis sans si ça échoue (certaines installations SUMO n'ont pas duarouter).
+    FIX 1 : Suppression de --edge-permission passenger (trop restrictif pour OSM Casablanca)
+    FIX 2 : Injection sur toute la durée sim (end=sim_duration) avec period adapté
     """
-    period = max(1, end // max(1, count))
     label  = "piétons" if pedestrians else "véhicules"
 
-    # Injection concentrée en 60s max → saturation visible immédiatement
-    injection_window = 60  # TOUJOURS 60s pour voir les véhicules dès le départ
-    period           = max(0, round(injection_window / max(1, count), 2))
-    if period < 0.5:
-        period = 0.5  # minimum 0.5s entre chaque véhicule
-    logger.info(f"Injection {count} véhicules en {injection_window}s (period={period}s)")
+    # FIX 2 : period calculé sur toute la durée → véhicules injectés en continu
+    period = max(1.0, end / max(1, count))
+    logger.info(f"Injection {count} {label} sur {end}s (period={period:.1f}s)")
 
-    # Commande de base : filtrer les edges motorisés pour les véhicules
+    # ── Tentative 1 : avec --validate, sans restriction edge-permission ──
     base_args = [
         "-n",       net_file,
         "-o",       trips_file,
         "-r",       rou_file,
         "--period", str(period),
         "--begin",  "0",
-        "--end",    str(injection_window),   # injecter dans la fenêtre courte
+        "--end",    str(end),
         "--no-warnings",
-        "--fringe-factor", "10",    # très favorable aux départs aux extrémités
-        "--min-distance",  "50",    # distance min réduite pour plus de routes valides
+        "--fringe-factor", "5",
+        "--min-distance",  "100",
     ]
 
     if pedestrians:
         base_args += ["--pedestrians"]
     else:
-        # Restreindre aux véhicules motorisés de type "passenger"
-        base_args += [
-            "--vehicle-class",  "passenger",
-            "--edge-permission", "passenger",
-            "--allow-fringe-speed", "true",
-        ]
+        # FIX 1 : PAS de --edge-permission ni --vehicle-class
+        # Ces options rejettent trop d'edges dans les réseaux OSM non annotés
+        base_args += ["--allow-fringe-speed", "true"]
 
-    # Tentative 1 : avec --validate (duarouter intégré → garantit routes valides)
     cmd1 = ["python3", random_trips] + base_args + ["--validate"]
     result = subprocess.run(cmd1, capture_output=True, text=True, timeout=timeout)
-    if result.returncode == 0 and os.path.exists(rou_file) and os.path.getsize(rou_file) > 100:
-        logger.info(f"✅ Routes {label} validées ({count}) [--validate]")
+    if result.returncode == 0 and _rou_has_vehicles(rou_file):
+        logger.info(f"✅ Routes {label} validées ({count}) [--validate sans edge-permission]")
         return True
-    logger.warning(f"randomTrips --validate échoué: {result.stderr[:200]}")
+    logger.warning(f"randomTrips tentative 1 échouée: {result.stderr[:200]}")
 
-    # Tentative 2 : sans --vehicle-class (plus permissif) mais avec --validate
+    # ── Tentative 2 : sans --validate, period plus court ──
     if os.path.exists(rou_file): os.remove(rou_file)
+    period2 = max(0.5, period / 2)
     base_args2 = [
         "-n", net_file, "-o", trips_file, "-r", rou_file,
-        "--period", str(period), "--end", str(end),
-        "--no-warnings", "--fringe-factor", "5",
+        "--period", str(period2), "--end", str(end),
+        "--no-warnings", "--fringe-factor", "10",
+        "--min-distance", "50",
     ]
     if pedestrians:
         base_args2.append("--pedestrians")
-    cmd2 = ["python3", random_trips] + base_args2 + ["--validate"]
+
+    cmd2 = ["python3", random_trips] + base_args2
     result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=timeout)
-    if result2.returncode == 0 and os.path.exists(rou_file) and os.path.getsize(rou_file) > 100:
-        logger.info(f"✅ Routes {label} générées ({count}) [sans vehicle-class]")
+    if result2.returncode == 0 and _rou_has_vehicles(rou_file):
+        logger.info(f"✅ Routes {label} ({count}) [sans validation]")
         return True
     logger.warning(f"randomTrips tentative 2 échouée: {result2.stderr[:200]}")
 
-    # Tentative 3 : sans --validate du tout (moins fiable mais dernier recours)
+    # ── Tentative 3 : paramètres minimaux ──
     if os.path.exists(rou_file): os.remove(rou_file)
-    cmd3 = ["python3", random_trips] + base_args2
+    cmd3 = [
+        "python3", random_trips,
+        "-n", net_file, "-o", trips_file, "-r", rou_file,
+        "--period", "2", "--end", str(end), "--no-warnings",
+    ]
+    if pedestrians:
+        cmd3.append("--pedestrians")
     result3 = subprocess.run(cmd3, capture_output=True, text=True, timeout=timeout)
-    if result3.returncode == 0 and os.path.exists(rou_file) and os.path.getsize(rou_file) > 100:
-        logger.info(f"✅ Routes {label} générées ({count}) [sans validation]")
+    if result3.returncode == 0 and _rou_has_vehicles(rou_file):
+        logger.info(f"✅ Routes {label} [params minimaux]")
         return True
 
-    logger.warning(f"randomTrips toutes tentatives échouées: {result3.stderr[:200]}")
+    logger.warning(f"randomTrips toutes tentatives échouées")
     return False
 
 
 def _is_motorized_edge(edge_elem) -> bool:
-    """
-    Retourne True si l'edge accepte les véhicules motorisés (passenger).
-    Filtre les edges piétons/cyclistes uniquement.
-    """
     lanes = edge_elem.findall("lane")
     if not lanes:
-        return True  # pas d'info → on garde
+        return True
     for lane in lanes:
         allow    = lane.get("allow",    "")
         disallow = lane.get("disallow", "")
-        speed    = float(lane.get("speed", "13.9"))  # 13.9 m/s ≈ 50 km/h par défaut
-        # Edge piéton pur : allow="pedestrian" ou "pedestrian bicycle"
-        ped_only_allows = {"pedestrian", "bicycle", "pedestrian bicycle",
-                           "bicycle pedestrian"}
+        speed    = float(lane.get("speed", "13.9"))
+        ped_only_allows = {"pedestrian", "bicycle", "pedestrian bicycle", "bicycle pedestrian"}
         if allow and allow.strip() in ped_only_allows:
             continue
-        # Vitesse max < 3 m/s (~11 km/h) → probablement piéton
         if speed < 3.0:
             continue
-        # Lane utilisable par les véhicules
         return True
     return False
 
 
 def _build_adjacency(net_file: str) -> dict:
-    """
-    Parse le réseau SUMO et construit une table d'adjacence edge→[edge_suivants].
-    Filtre les edges piétons/cyclistes uniquement.
-    """
     adj: dict = {}
     try:
         tree = ET.parse(net_file)
         root = tree.getroot()
-        # Initialiser les edges motorisés uniquement
         for e in root.findall(".//edge"):
             eid = e.get("id", "")
             if eid and not eid.startswith(":") and _is_motorized_edge(e):
                 adj[eid] = []
-        # Connexions entre edges motorisés
         for conn in root.findall(".//connection"):
             frm = conn.get("from", "")
             to  = conn.get("to",   "")
@@ -260,16 +238,11 @@ def _build_adjacency(net_file: str) -> dict:
     return adj
 
 
-def _bfs_route(adj: dict, start: str, max_depth: int = 20) -> list:
-    """
-    BFS depuis start pour trouver le chemin le plus long accessible.
-    Retourne la liste d'edges du chemin.
-    """
+def _bfs_route(adj: dict, start: str, max_depth: int = 25) -> list:
     from collections import deque
     best_path = [start]
     queue     = deque([[start]])
     visited   = {start}
-
     while queue:
         path = queue.popleft()
         if len(path) > len(best_path):
@@ -280,58 +253,52 @@ def _bfs_route(adj: dict, start: str, max_depth: int = 20) -> list:
             if nxt not in visited:
                 visited.add(nxt)
                 queue.append(path + [nxt])
-
     return best_path
 
 
-def _generate_minimal_routes(rou_file: str, net_file: str, count: int):
+def _generate_minimal_routes(rou_file: str, net_file: str, count: int, sim_duration: int = 3600):
     """
-    Fallback : génère des routes valides sans randomTrips en utilisant
-    la topologie réelle du réseau (connexions entre edges).
-
-    Stratégie :
-      1. Construire le graphe d'adjacence depuis les <connection> du .net.xml
-      2. BFS depuis plusieurs points de départ pour trouver des chemins valides
-      3. Distribuer les véhicules sur ces chemins
+    FIX 5 : flows continus bien répartis + injection initiale dense
     """
     adj    = _build_adjacency(net_file)
     edges  = list(adj.keys())
 
     if not edges:
-        logger.warning("Aucun edge trouvé dans le réseau — routes vides")
+        logger.warning("Aucun edge trouvé — routes vides")
         with open(rou_file, "w") as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n<routes/>\n')
         return
 
-    # Trouver des chemins valides depuis différents points de départ
-    # Générer autant de routes uniques que possible (objectif = count routes)
-    valid_routes: list[list] = []
-    # Parcourir tous les edges comme points de départ possibles
     import random as _rnd
     _rnd.seed(42)
     shuffled = list(edges)
     _rnd.shuffle(shuffled)
+
+    valid_routes: list = []
     for start in shuffled:
-        path = _bfs_route(adj, start, max_depth=20)
-        if len(path) >= 2 and path not in valid_routes:
+        path = _bfs_route(adj, start, max_depth=25)
+        if len(path) >= 3 and path not in valid_routes:
             valid_routes.append(path)
-        if len(valid_routes) >= max(count, 20):
+        if len(valid_routes) >= max(count, 30):
             break
 
-    # Fallback : route single-edge si aucun chemin multi-edge
     if not valid_routes:
         logger.warning("Aucun chemin connecté — route single-edge")
         valid_routes = [[e] for e in edges[:min(count, len(edges))]]
 
-    # Écrire le fichier routes
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<routes>',
-        # vType : accel forte, teleport au bout de route activé via sumocfg,
-        # routingMode=1 = reroutage dynamique si route bloquée
-        '  <vType id="DEFAULT_VEHTYPE" accel="3.0" decel="6.0" maxSpeed="22.22"'
-        ' speedFactor="1.2" speedDev="0.1" sigma="0.3" length="4.5"'
-        ' minGap="1.5" tau="0.8" lcStrategic="1.0" lcCooperative="0.3"/>',
+        # sigma=0.5 = conducteurs imparfaits → pas de convoi synchronisé
+        # tau=0.8 = réaction rapide → moins de stops
+        # speedDev=0.2 = variabilité de vitesse → trafic naturel
+        '  <vType id="DEFAULT_VEHTYPE" accel="2.6" decel="4.5" maxSpeed="22.22"'
+        ' speedFactor="1.1" speedDev="0.2" sigma="0.5" length="4.5"'
+        ' minGap="1.5" tau="0.8" lcStrategic="1.0" lcCooperative="0.5"/>',
+        # Camions — plus lents, créent de la congestion naturelle
+        '  <vType id="TRUCK_VEHTYPE" accel="1.2" decel="3.0" maxSpeed="16.0"'
+        ' speedFactor="0.9" speedDev="0.1" sigma="0.3" length="8.0"'
+        ' minGap="2.5" tau="1.2" guiShape="truck"/>',
     ]
 
     route_ids = []
@@ -340,44 +307,39 @@ def _generate_minimal_routes(rou_file: str, net_file: str, count: int):
         lines.append(f'  <route id="{rid}" edges="{" ".join(path)}"/>')
         route_ids.append(rid)
 
-    # Phase 1 : injection initiale en 30s pour saturation immédiate
-    # Phase 2 : flow continu toutes les 60s pour maintenir la densité
+    # Injection initiale dense : tous les véhicules en 60s
     for i in range(count):
         rid    = route_ids[i % len(route_ids)]
-        depart = round(i * 30.0 / max(1, count), 1)  # tous injectés en 30s
+        depart = round(i * 60.0 / max(1, count), 2)
+        vtype  = "TRUCK_VEHTYPE" if i % 8 == 0 else "DEFAULT_VEHTYPE"  # 1/8 camions
+        lines.append(f'  <vehicle id="veh{i}" type="{vtype}" route="{rid}" depart="{depart}"/>')
+
+    # Flows continus très denses — un véhicule toutes les 3-8s par route
+    # pour maintenir une densité élevée pendant toute la simulation
+    n_flows = min(len(route_ids), 30)
+    # period = nb secondes entre chaque véhicule par flow
+    # Pour count=100 véhicules sur 30 flows : 1 veh/3s par flow
+    flow_period = max(3, 90 // max(1, n_flows))
+    for i in range(n_flows):
+        rid   = route_ids[i % len(route_ids)]
+        vtype = "TRUCK_VEHTYPE" if i % 6 == 0 else "DEFAULT_VEHTYPE"
         lines.append(
-            f'  <vehicle id="veh{i}" type="DEFAULT_VEHTYPE" route="{rid}" depart="{depart}" speedFactor="1.2"/>'
+            f'  <flow id="flow{i}" type="{vtype}" route="{rid}"'
+            f' begin="60" end="{sim_duration}" period="{flow_period}"/>'
         )
 
-    # Flows continus pour remplacer les véhicules qui finissent leur route
-    # Un flow génère un véhicule toutes les X secondes sur chaque route
-    flow_period = max(5, 120 // max(1, len(route_ids)))  # ex: 10 routes → 1 veh/12s par route
-    for i, rid in enumerate(route_ids[:min(len(route_ids), 20)]):
-        lines.append(
-            f'  <flow id="flow{i}" type="DEFAULT_VEHTYPE" route="{rid}" begin="60" end="86400" period="{flow_period}" speedFactor="1.2"/>'
-        )
     lines.append("</routes>")
-
     with open(rou_file, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    logger.info(f"✅ Routes valides générées ({count} véhicules sur {len(valid_routes)} routes)")
+    logger.info(f"✅ Routes BFS : {count} véhicules + {n_flows} flows continus")
 
 
-def _find_nearest_edge(
-    lat: float, lng: float, lane_positions: List[Tuple]
-) -> Optional[str]:
-    """
-    Retourne l'edge le plus proche d'un point GPS.
-    lane_positions : liste de (edge_id, x_sumo, y_sumo).
-    La correspondance GPS↔SUMO est approximative (pas de projection exacte ici).
-    """
+def _find_nearest_edge(lat, lng, lane_positions):
     if not lane_positions:
         return None
-    # Approximation : traiter lat/lng comme des coordonnées proportionnelles
     best_edge = None
     best_dist = float("inf")
     for eid, x, y in lane_positions:
-        # Normalisation grossière : 1° ≈ 111 km
         dx = (lng - x / 111320) * 1e5
         dy = (lat - y / 111320) * 1e5
         dist = dx * dx + dy * dy
@@ -387,7 +349,6 @@ def _find_nearest_edge(
     return best_edge
 
 
-# Causes d'accident disponibles
 ACCIDENT_CAUSES = {
     "collision": {"label": "Collision",             "color": "1,0,0",      "n_vehicles": 2},
     "panne":     {"label": "Panne / Arrêt brusque", "color": "1,0.5,0",    "n_vehicles": 1},
@@ -397,23 +358,15 @@ ACCIDENT_CAUSES = {
     "inconnu":   {"label": "Accident inconnu",      "color": "0.5,0.5,0.5","n_vehicles": 1},
 }
 
-# vType dédié aux véhicules accidentés : immobiles, accel nulle, taille légèrement augmentée
-ACCIDENT_VTYPE = """  <vType id="ACCIDENT_VTYPE" accel="0.0" decel="0.0" maxSpeed="0.01"
-         length="5.5" width="2.2" sigma="0.0" speedFactor="0.0"
+ACCIDENT_VTYPE = """  <vType id="ACCIDENT_VTYPE" accel="0.001" decel="9.0" maxSpeed="0.01"
+         length="5.5" width="2.2" sigma="0.0"
+         speedFactor="0.20" speedDev="0.0"
          guiShape="passenger" color="1,0,0"/>"""
 
 def _inject_accidents(rou_file: str, accidents: List[Dict], net_file: str):
-    """
-    Injecte les accidents dans le .rou.xml :
-    - Collision  → 2 véhicules bloqués côte à côte (5m d'écart), simule l'impact
-    - Panne      → 1 véhicule bloqué au milieu de la voie
-    - Autres     → 1 véhicule bloqué
-    Les véhicules normaux s'accumulent derrière.
-    """
     try:
         net_tree = ET.parse(net_file)
         lane_positions: List[Tuple] = []
-        # Récupérer aussi la longueur de chaque edge
         edge_lengths: dict = {}
         for edge in net_tree.getroot().findall(".//edge"):
             eid = edge.get("id", "")
@@ -435,7 +388,6 @@ def _inject_accidents(rou_file: str, accidents: List[Dict], net_file: str):
         rou_tree = ET.parse(rou_file)
         rou_root = rou_tree.getroot()
 
-        # Insérer le vType accident en tête du fichier routes
         vtype_el = ET.fromstring(ACCIDENT_VTYPE.strip())
         rou_root.insert(0, vtype_el)
 
@@ -444,38 +396,21 @@ def _inject_accidents(rou_file: str, accidents: List[Dict], net_file: str):
             if not edge and lane_positions:
                 edge = lane_positions[i % len(lane_positions)][0]
             if not edge:
-                logger.warning(f"Accident #{i} : aucun edge trouvé, ignoré")
                 continue
 
-            # Cause
             raw_cause = (acc.get("cause") or acc.get("type") or "inconnu").lower()
             if raw_cause not in ACCIDENT_CAUSES:
-                if "collision" in raw_cause or "crash" in raw_cause:
-                    raw_cause = "collision"
-                elif "panne" in raw_cause or "brusque" in raw_cause:
-                    raw_cause = "panne"
-                elif "feu" in raw_cause:
-                    raw_cause = "feu_rouge"
-                elif "obstacle" in raw_cause:
-                    raw_cause = "obstacle"
-                elif "pieton" in raw_cause or "piéton" in raw_cause:
-                    raw_cause = "pietons"
-                else:
-                    import random
-                    raw_cause = random.choice(list(ACCIDENT_CAUSES.keys()))
+                import random
+                raw_cause = random.choice(list(ACCIDENT_CAUSES.keys()))
 
             cause_info = ACCIDENT_CAUSES[raw_cause]
             n_veh      = cause_info["n_vehicles"]
             edge_len   = edge_lengths.get(edge, 50.0)
             depart_t   = str(5 + i * 2)
-
-            # Position de base : milieu de l'edge
             base_pos   = max(3.0, min(edge_len * 0.4, edge_len - 10.0))
 
             for j in range(n_veh):
-                # Pour une collision : 2 véhicules à 4m d'écart sur la même voie
-                # → forcent les véhicules normaux à s'arrêter derrière
-                pos_offset = j * 4.5  # 4.5m entre les deux véhicules impliqués
+                pos_offset = j * 4.5
                 start_pos  = max(1.0, base_pos + pos_offset)
                 end_pos    = start_pos + 4.5
                 if end_pos > edge_len - 1:
@@ -494,51 +429,31 @@ def _inject_accidents(rou_file: str, accidents: List[Dict], net_file: str):
                 veh_el.set("route",  f"acc_route_{i}_{j}")
                 veh_el.set("depart", depart_t)
                 veh_el.set("color",  cause_info["color"])
-                # Angle aléatoire pour simuler un véhicule renversé/de travers
-                if raw_cause == "collision":
-                    import random as _r
-                    veh_el.set("departSpeed", "0")
-                    # Angle de -45° à +45° par rapport à la route (véhicule de travers)
-                    # SUMO ne supporte pas l'angle explicite en XML, mais la couleur rouge
-                    # et le type dédié le rendent bien visible
 
                 stop_el = ET.SubElement(veh_el, "stop")
-                stop_el.set("edge",      edge)
-                stop_el.set("duration",  "9999")
-                stop_el.set("startPos",  f"{start_pos:.1f}")
-                stop_el.set("endPos",    f"{end_pos:.1f}")
-                stop_el.set("parking",   "false")
+                stop_el.set("edge",     edge)
+                stop_el.set("duration", "9999")
+                stop_el.set("startPos", f"{start_pos:.1f}")
+                stop_el.set("endPos",   f"{end_pos:.1f}")
+                stop_el.set("parking",  "false")
 
-                # ID canonique pour la détection backend (toujours accident_cause_i)
-                # Les véhicules _i_1 sont ignorés pour les stats, seul _i_0 compte
                 if j == 1:
-                    # Deuxième véhicule de la collision : marquer comme "partie" de l'accident principal
                     veh_el.set("id", f"accident_{raw_cause}_{i}_b")
 
-            # Log
-            logger.info(f"Accident #{i} ({raw_cause}) → edge {edge}, {n_veh} véhicule(s), pos {base_pos:.1f}m")
+            logger.info(f"Accident #{i} ({raw_cause}) → edge {edge}")
 
         rou_tree.write(rou_file, encoding="unicode", xml_declaration=True)
-        logger.info(f"✅ {len(accidents)} accidents injectés dans {rou_file}")
+        logger.info(f"✅ {len(accidents)} accidents injectés")
 
     except Exception as e:
-        logger.warning(f"_inject_accidents non bloquant : {e}")
+        logger.warning(f"_inject_accidents : {e}")
         import traceback; traceback.print_exc()
 
 
-def _write_sumocfg(
-    cfg_file: str,
-    net_name:  str = "casa.net.xml",
-    rou_name:  str = "casa.rou.xml",
-    ped_name:  Optional[str] = None,
-    end:       int = 3600,
-):
-    """Écrit un fichier .sumocfg SUMO complet."""
-    additional = ""
-    if ped_name:
-        additional = f'\n        <additional-files value="{ped_name}"/>'
-
-    # Structure identique au sumocfg de base + paramètres pour fluidité
+def _write_sumocfg(cfg_file, net_name="casa.net.xml", rou_name="casa.rou.xml",
+                   ped_name=None, end=3600):
+    """FIX 4 : step-length 0.1 pour fluidité maximale côté frontend."""
+    additional = f'\n        <additional-files value="{ped_name}"/>' if ped_name else ""
     content = f"""<?xml version="1.0" encoding="utf-8"?>
 <configuration>
     <input>
@@ -549,18 +464,17 @@ def _write_sumocfg(
     <time>
         <begin value="0" />
         <end value="86400" />
-        <step-length value="0.5" />
+        <step-length value="0.1" />
     </time>
 
     <processing>
         <ignore-route-errors value="true" />
-        <time-to-teleport value="60" />
+        <time-to-teleport value="120" />
         <time-to-teleport.highways value="-1" />
-        <lanechange.duration value="0" />
         <collision.action value="teleport" />
         <collision.mingap-factor value="0" />
+        <max-depart-delay value="60" />
         <emergencydecel.warning-threshold value="1.1" />
-        <max-depart-delay value="30" />
     </processing>
 
     <routing>
@@ -578,61 +492,28 @@ def _write_sumocfg(
     logger.info(f"✅ .sumocfg écrit : {cfg_file}")
 
 
-# ──────────────────────────────────────────────────────────────
-# SERVICE PRINCIPAL
-# ──────────────────────────────────────────────────────────────
+# ── SERVICE PRINCIPAL ──────────────────────────────────────────────────────────
 
 class GenerateService:
-    """
-    Service de génération de scénarios SUMO.
-
-    Usage :
-        svc    = GenerateService(sumo_data_dir="/app/maps")
-        result = await svc.generate(bbox, vehicle_count, pedestrian_count, accidents)
-    """
 
     def __init__(self, sumo_data_dir: str):
         self.sumo_data_dir = sumo_data_dir
         os.makedirs(sumo_data_dir, exist_ok=True)
 
-    # ── Entrée publique ───────────────────────────────────────
-
-    async def generate(
-        self,
-        bbox:             Dict,
-        vehicle_count:    int  = 50,
-        pedestrian_count: int  = 20,
-        accidents:        List[Dict] = None,
-        sim_duration:     int  = 6000,   # identique au sumocfg de référence
-        scenario_name:    str  = "",
-    ) -> Dict:
-        """
-        Génère un scénario SUMO complet et le déploie dans sumo_data_dir.
-
-        Retourne un dict avec :
-          - status          : "deployed"
-          - message         : résumé lisible
-          - scenario_id     : identifiant unique du scénario (= nom du dossier)
-          - deployed_files  : liste des fichiers copiés
-          - generation_log  : étapes réalisées
-          - bbox            : bbox utilisée
-        """
+    async def generate(self, bbox, vehicle_count=50, pedestrian_count=20,
+                       accidents=None, sim_duration=3600, scenario_name="") -> Dict:
         accidents = accidents or []
         ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Nom du dossier : utilise le nom saisi ou un nom auto
-        safe_name   = "".join(c for c in scenario_name.strip() if c.isalnum() or c in "-_ ")
-        safe_name   = safe_name.replace(" ", "_")[:40]
+        safe_name = "".join(c for c in scenario_name.strip() if c.isalnum() or c in "-_ ")
+        safe_name = safe_name.replace(" ", "_")[:40]
         scenario_id = safe_name if safe_name else f"scenario_{ts}"
-        # Si le dossier existe déjà, suffixer avec le timestamp
         if os.path.exists(os.path.join(self.sumo_data_dir, scenario_id)):
             scenario_id = f"{scenario_id}_{ts}"
 
-        # Dossier de travail temporaire (nettoyé automatiquement)
         tmpdir = tempfile.mkdtemp(prefix=f"sumo_{ts}_")
         log    = []
 
         try:
-            # Chemins des fichiers intermédiaires
             osm_path   = os.path.join(tmpdir, "zone.osm")
             net_file   = os.path.join(tmpdir, "generated.net.xml")
             rou_file   = os.path.join(tmpdir, "generated.rou.xml")
@@ -641,8 +522,8 @@ class GenerateService:
             ped_trips  = os.path.join(tmpdir, "ped_trips.xml")
             cfg_file   = os.path.join(tmpdir, "generated.sumocfg")
 
-            # ── 1. Réseau ──────────────────────────────────────────────
-            net_ok    = False
+            # ── 1. Réseau ──────────────────────────────────────────────────────
+            net_ok     = False
             osm_method = "osm"
 
             osm_ok = _download_osm(bbox, osm_path)
@@ -651,21 +532,19 @@ class GenerateService:
                 if net_ok:
                     log.append("✅ Réseau réel OSM → SUMO (netconvert)")
                 else:
-                    log.append("⚠️ netconvert échoué, passage en réseau synthétique")
+                    log.append("⚠️ netconvert échoué → réseau synthétique")
                     osm_method = "grid"
             else:
-                log.append("⚠️ Téléchargement OSM échoué, réseau synthétique")
+                log.append("⚠️ Téléchargement OSM échoué → réseau synthétique")
                 osm_method = "grid"
 
             if not net_ok:
                 net_ok = _netgenerate_grid(net_file, bbox)
                 if not net_ok:
-                    raise RuntimeError(
-                        "Impossible de générer le réseau SUMO (netconvert et netgenerate ont échoué)"
-                    )
-                log.append(f"✅ Réseau synthétique en grille généré")
+                    raise RuntimeError("Impossible de générer le réseau SUMO")
+                log.append("✅ Réseau synthétique en grille généré")
 
-            # ── 2. Routes véhicules ────────────────────────────────────
+            # ── 2. Routes véhicules ────────────────────────────────────────────
             random_trips = _find_random_trips()
             rou_ok       = False
 
@@ -678,26 +557,24 @@ class GenerateService:
                     log.append(f"✅ {vehicle_count} véhicules via randomTrips.py")
 
             if not rou_ok:
-                _generate_minimal_routes(rou_file, net_file, vehicle_count)
-                log.append(f"✅ {vehicle_count} véhicules (routes minimales)")
+                _generate_minimal_routes(rou_file, net_file, vehicle_count, sim_duration)
+                log.append(f"✅ {vehicle_count} véhicules (routes BFS + flows continus)")
 
-            # ── 3. Piétons ─────────────────────────────────────────────
+            # ── 3. Piétons ─────────────────────────────────────────────────────
             ped_deployed = None
             if pedestrian_count > 0 and random_trips:
                 ped_ok = _generate_routes_random_trips(
                     random_trips, net_file, ped_trips, ped_file,
-                    count=pedestrian_count, end=sim_duration,
-                    pedestrians=True,
+                    count=pedestrian_count, end=sim_duration, pedestrians=True,
                 )
                 if ped_ok:
                     ped_deployed = "casa.ped.xml"
                     log.append(f"✅ {pedestrian_count} piétons générés")
                 else:
-                    log.append(f"⚠️ Génération piétons échouée (ignorée)")
-            elif pedestrian_count > 0:
-                log.append("⚠️ randomTrips.py introuvable — piétons ignorés")
+                    log.append("⚠️ Génération piétons échouée (ignorée)")
 
-            # ── 3b. Validation des routes avec duarouter (si disponible) ──
+            # ── 3b. Validation duarouter ───────────────────────────────────────
+            # FIX 3 : vérifier que duarouter produit un fichier avec des véhicules
             try:
                 import shutil as _sh
                 duarouter_path = _sh.which("duarouter")
@@ -711,31 +588,25 @@ class GenerateService:
                         "--ignore-errors",
                         "--no-warnings",
                     ], capture_output=True, text=True, timeout=120)
-                    if val_result.returncode == 0 and os.path.exists(validated) and os.path.getsize(validated) > 100:
-                        import shutil as _sh2
-                        _sh2.copy2(validated, rou_file)
+                    # FIX 3 : utiliser le fichier validé SEULEMENT s'il contient des véhicules
+                    if val_result.returncode == 0 and _rou_has_vehicles(validated, min_count=5):
+                        shutil.copy2(validated, rou_file)
                         log.append("✅ Routes validées par duarouter")
                     else:
-                        log.append(f"⚠️ duarouter ignoré (retour: {val_result.returncode})")
+                        log.append("⚠️ duarouter ignoré (fichier résultant vide ou invalide)")
             except Exception as val_err:
                 log.append(f"⚠️ Validation duarouter ignorée : {val_err}")
 
-            # ── 4. Accidents ───────────────────────────────────────────
+            # ── 4. Accidents ───────────────────────────────────────────────────
             if accidents:
                 _inject_accidents(rou_file, accidents, net_file)
                 log.append(f"✅ {len(accidents)} accidents injectés")
 
-            # ── 5. Configuration SUMO ──────────────────────────────────
-            _write_sumocfg(
-                cfg_file,
-                net_name  = "casa.net.xml",
-                rou_name  = "casa.rou.xml",
-                ped_name  = ped_deployed,
-                end       = sim_duration,
-            )
-            log.append("✅ casa.sumocfg généré")
+            # ── 5. Configuration SUMO ──────────────────────────────────────────
+            _write_sumocfg(cfg_file, ped_name=ped_deployed, end=sim_duration)
+            log.append("✅ casa.sumocfg généré (step-length=0.1)")
 
-            # ── 6. Sauvegarde du scénario dans un sous-dossier daté ────
+            # ── 6. Sauvegarde scénario ─────────────────────────────────────────
             scenario_dir = os.path.join(self.sumo_data_dir, scenario_id)
             os.makedirs(scenario_dir, exist_ok=True)
 
@@ -747,23 +618,16 @@ class GenerateService:
             if ped_deployed and os.path.exists(ped_file):
                 deploy_map[ped_file] = ("casa.ped.xml", scenario_dir)
 
-            # ── 7. Déploiement actif : copier vers sumo_data_dir ───────
             deployed = []
             for src, (dst_name, dst_dir) in deploy_map.items():
                 if not os.path.exists(src):
                     continue
-                # Copie dans le dossier scénario (archivage)
                 shutil.copy2(src, os.path.join(dst_dir, dst_name))
-                # Copie active (remplace les fichiers en cours)
                 active_dst = os.path.join(self.sumo_data_dir, dst_name)
                 shutil.copy2(src, active_dst)
                 deployed.append(dst_name)
-                logger.info(
-                    f"📦 Déployé : {dst_name} "
-                    f"({os.path.getsize(active_dst):,} bytes)"
-                )
+                logger.info(f"📦 Déployé : {dst_name} ({os.path.getsize(active_dst):,} bytes)")
 
-            # Écrire un metadata.json dans le dossier scénario
             import json
             metadata = {
                 "scenario_id":      scenario_id,
@@ -785,11 +649,7 @@ class GenerateService:
             return {
                 "status":         "deployed",
                 "scenario_id":    scenario_id,
-                "message":        (
-                    f"Scénario généré — {vehicle_count} véhicules, "
-                    f"{pedestrian_count} piétons, "
-                    f"{len(accidents)} accidents"
-                ),
+                "message":        f"Scénario généré — {vehicle_count} véhicules, {pedestrian_count} piétons, {len(accidents)} accidents",
                 "deployed_files": deployed,
                 "generation_log": log,
                 "bbox":           bbox,
@@ -798,20 +658,12 @@ class GenerateService:
 
         except Exception as e:
             logger.error(f"❌ GenerateService.generate : {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             raise
-
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # ── Utilitaires publics ───────────────────────────────────
-
     def list_scenarios(self) -> List[Dict]:
-        """
-        Liste tous les scénarios archivés dans sumo_data_dir.
-        Chaque entrée contient les métadonnées du scenario.
-        """
         import json
         scenarios = []
         for name in sorted(os.listdir(self.sumo_data_dir), reverse=True):
@@ -824,30 +676,19 @@ class GenerateService:
                     with open(meta_path) as f:
                         scenarios.append(json.load(f))
                 except Exception:
-                    scenarios.append({"scenario_id": name, "error": "metadata illisible"})
+                    scenarios.append({"scenario_id": name})
         return scenarios
 
     def get_active_scenario(self) -> Optional[str]:
-        """
-        Retourne l'ID du dernier scénario déployé en lisant
-        le metadata.json le plus récent.
-        """
         scenarios = self.list_scenarios()
         return scenarios[0]["scenario_id"] if scenarios else None
 
     def deploy_scenario(self, scenario_id: str) -> bool:
-        """
-        Redéploie un scénario archivé comme scénario actif.
-        Utile pour revenir à un scénario précédent.
-        """
         src_dir = os.path.join(self.sumo_data_dir, scenario_id)
         if not os.path.isdir(src_dir):
-            logger.error(f"Scénario introuvable : {scenario_id}")
             return False
-
         for fname in ["casa.net.xml", "casa.rou.xml", "casa.sumocfg", "casa.ped.xml"]:
             src = os.path.join(src_dir, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(self.sumo_data_dir, fname))
-                logger.info(f"♻️  Redéployé : {fname}")
         return True

@@ -91,18 +91,10 @@ class ScenarioConfigService:
 
     def get_active_dir(self) -> str:
         """
-        Retourne le dossier contenant les fichiers SUMO actifs.
-        - Si un scénario est sélectionné → maps/<scenario_id>/
-        - Sinon → maps/ (fichiers racine)
+        Retourne TOUJOURS maps/ racine.
+        Les fichiers du scénario actif ont été copiés là lors de select_scenario().
+        SUMO lit toujours les mêmes chemins, ce qui évite tout problème de CWD.
         """
-        if self._active_scenario_id:
-            sc_dir = os.path.join(self.sumo_data_dir, self._active_scenario_id)
-            if os.path.isdir(sc_dir):
-                return sc_dir
-            else:
-                logger.warning(f"Dossier scénario disparu : {sc_dir}, retour au fallback")
-                self._active_scenario_id = None
-                self._save_active_state()
         return self.sumo_data_dir
 
     def get_config_path(self) -> str:
@@ -289,26 +281,47 @@ class ScenarioConfigService:
 
     # ── Sélection / déploiement ────────────────────────────────────────────────
 
+    def _backup_default(self):
+        """
+        Sauvegarde les fichiers par défaut dans maps/_default_backup/
+        si ce n'est pas déjà fait. Appelé UNE SEULE FOIS avant le premier écrasement.
+        """
+        backup_dir = os.path.join(self.sumo_data_dir, "_default_backup")
+        if os.path.isdir(backup_dir):
+            return  # déjà sauvegardé
+        os.makedirs(backup_dir, exist_ok=True)
+        copied = []
+        for fname in REQUIRED_FILES + ["casa.ped.xml", "casa.osm",
+                                        "casa.trips.xml", "routes.rou.xml"]:
+            src = os.path.join(self.sumo_data_dir, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(backup_dir, fname))
+                copied.append(fname)
+        # Sauvegarder aussi un metadata
+        import json as _json
+        with open(os.path.join(backup_dir, "metadata.json"), "w") as f:
+            _json.dump({
+                "scenario_id":   "_default_backup",
+                "scenario_name": "Fichiers par défaut",
+                "generated_at":  __import__("datetime").datetime.utcnow().isoformat(),
+                "backed_up_files": copied,
+            }, f, indent=2)
+        logger.info(f"✅ Backup défaut : {copied}")
+
     def select_scenario(self, scenario_id: str) -> Dict:
         """
-        Sélectionne un scénario comme actif SANS copier les fichiers.
-        La simulation pointera directement vers maps/<scenario_id>/.
-
-        Returns dict avec success, message, validation.
+        Sélectionne un scénario en COPIANT ses fichiers sur les fichiers racine.
+        Les fichiers par défaut sont d'abord sauvegardés dans _default_backup/.
+        La simulation utilise toujours maps/ → aucun chdir à changer.
         """
         sc_dir = os.path.join(self.sumo_data_dir, scenario_id)
 
         if not os.path.isdir(sc_dir):
-            return {
-                "success": False,
-                "message": f"Dossier introuvable : {scenario_id}",
-            }
+            return {"success": False, "message": f"Dossier introuvable : {scenario_id}"}
 
-        # Vérifier que les fichiers requis sont présents
-        missing = [
-            f for f in REQUIRED_FILES
-            if not os.path.exists(os.path.join(sc_dir, f))
-        ]
+        # Vérifier fichiers requis
+        missing = [f for f in REQUIRED_FILES
+                   if not os.path.exists(os.path.join(sc_dir, f))]
         if missing:
             return {
                 "success": False,
@@ -316,44 +329,10 @@ class ScenarioConfigService:
                 "missing": missing,
             }
 
-        self._active_scenario_id = scenario_id
-        self._save_active_state()
+        # 1. Sauvegarder les fichiers par défaut (une seule fois)
+        self._backup_default()
 
-        logger.info(f"✅ Scénario sélectionné : {scenario_id} → {sc_dir}")
-        return {
-            "success":     True,
-            "scenario_id": scenario_id,
-            "dir":         sc_dir,
-            "message":     f"Scénario '{scenario_id}' sélectionné — prêt à démarrer",
-        }
-
-    def select_default(self) -> Dict:
-        """
-        Revient aux fichiers racine de maps/ (pas de scénario sélectionné).
-        """
-        self._active_scenario_id = None
-        self._save_active_state()
-        logger.info("✅ Retour aux fichiers de simulation par défaut (maps/)")
-
-        validation = self.validate()
-        return {
-            "success":     True,
-            "scenario_id": None,
-            "dir":         self.sumo_data_dir,
-            "message":     "Fichiers par défaut sélectionnés",
-            "valid":       validation["valid"],
-            "missing":     validation["missing"],
-        }
-
-    def deploy_and_select(self, scenario_id: str) -> Dict:
-        """
-        Copie les fichiers du scénario vers maps/ ET le sélectionne.
-        Utile pour maintenir la compatibilité avec l'ancien comportement.
-        """
-        sc_dir = os.path.join(self.sumo_data_dir, scenario_id)
-        if not os.path.isdir(sc_dir):
-            return {"success": False, "message": f"Scénario introuvable : {scenario_id}"}
-
+        # 2. Copier les fichiers du scénario vers la racine maps/
         copied = []
         for fname in REQUIRED_FILES + ["casa.ped.xml"]:
             src = os.path.join(sc_dir, fname)
@@ -361,17 +340,55 @@ class ScenarioConfigService:
                 dst = os.path.join(self.sumo_data_dir, fname)
                 shutil.copy2(src, dst)
                 copied.append(fname)
+                logger.info(f"  📦 {fname} → maps/ ({os.path.getsize(dst):,} bytes)")
 
         self._active_scenario_id = scenario_id
         self._save_active_state()
 
-        logger.info(f"✅ Déployé et sélectionné : {scenario_id} ({copied})")
+        logger.info(f"✅ Scénario '{scenario_id}' actif — fichiers copiés dans maps/")
         return {
-            "success":        True,
-            "scenario_id":    scenario_id,
-            "copied_files":   copied,
-            "message":        f"'{scenario_id}' déployé et activé",
+            "success":      True,
+            "scenario_id":  scenario_id,
+            "dir":          self.sumo_data_dir,
+            "copied_files": copied,
+            "message":      f"Scénario '{scenario_id}' actif — {len(copied)} fichiers copiés dans maps/",
         }
+
+    def select_default(self) -> Dict:
+        """
+        Revient aux fichiers par défaut en restaurant depuis _default_backup/.
+        """
+        backup_dir = os.path.join(self.sumo_data_dir, "_default_backup")
+
+        if os.path.isdir(backup_dir):
+            restored = []
+            for fname in REQUIRED_FILES + ["casa.ped.xml", "routes.rou.xml",
+                                            "casa.trips.xml", "casa.osm"]:
+                src = os.path.join(backup_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(self.sumo_data_dir, fname))
+                    restored.append(fname)
+            logger.info(f"✅ Fichiers par défaut restaurés : {restored}")
+        else:
+            logger.warning("⚠️ Aucun backup trouvé — fichiers racine utilisés tels quels")
+
+        self._active_scenario_id = None
+        self._save_active_state()
+        logger.info("✅ Mode défaut actif")
+
+        validation = self.validate()
+        return {
+            "success":     True,
+            "scenario_id": None,
+            "dir":         self.sumo_data_dir,
+            "message":     "Fichiers par défaut restaurés dans maps/",
+            "valid":       validation["valid"],
+            "missing":     validation["missing"],
+        }
+
+    def deploy_and_select(self, scenario_id: str) -> Dict:
+        """Alias de select_scenario (compatibilité)."""
+        return self.select_scenario(scenario_id)
 
     # ── Liste des scénarios disponibles ───────────────────────────────────────
 

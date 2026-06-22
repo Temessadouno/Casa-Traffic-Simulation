@@ -1,4 +1,12 @@
-# /app/main.py
+# /app/main.py  — VERSION CORRIGÉE
+#
+# Corrections appliquées :
+#   FIX A — warm-up accidents : exclure les IDs "_b" de _acc_expected
+#   FIX B — reset ACTIVE_JOURNEY_ID = None au démarrage
+#   FIX C — guards "if ACTIVE_JOURNEY_ID" dans la boucle broadcast
+#   FIX D — reset ACTIVE_JOURNEY_ID = None à l'arrêt
+#
+
 import asyncio
 import socketio
 import traci
@@ -68,10 +76,25 @@ except ImportError as e:
     logger.error(f"❌ Erreur import ScenarioConfigService: {e}")
     ScenarioConfigService = None
 
+try:
+    from src.services.LSTMTrainService import LSTMTrainService
+    from src.services.LSTMPredictorService import LSTMPredictorService
+    logger.info("✅ LSTM services importés")
+except ImportError as e:
+    logger.warning(f"⚠️ LSTM non disponible (tensorflow manquant ?): {e}")
+    LSTMTrainService     = None
+    LSTMPredictorService = None
+
 # ============================================================
 # 1. APP SETUP
 # ============================================================
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins="*",
+    ping_timeout=60,       # 60s avant déconnexion (défaut=20s trop court)
+    ping_interval=25,      # ping toutes les 25s
+    max_http_buffer_size=1_000_000,
+)
 fastapi_app = FastAPI(title="TMT Traffic Control — Casablanca with AI Predictions")
 
 fastapi_app.add_middleware(
@@ -88,20 +111,20 @@ if api_router:
 # ============================================================
 # 2. MONGODB
 # ============================================================
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://mongodb:27017")
+MONGO_URI     = os.getenv("MONGO_URI",     "mongodb://mongodb:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "traffic_simulation")
 
-db = None
+db     = None
 client = None
 
 try:
     client = AsyncIOMotorClient(MONGO_URI)
-    db = client[DATABASE_NAME]
+    db     = client[DATABASE_NAME]
     client.admin.command('ping')
     logger.info("✅ Connexion MongoDB établie")
 except Exception as e:
     logger.error(f"❌ Erreur configuration MongoDB: {e}")
-    db = None
+    db     = None
     client = None
 
 # ============================================================
@@ -114,8 +137,6 @@ if db is not None and PersistenceService is not None:
         logger.info("✅ PersistenceService initialisé")
     except Exception as e:
         logger.error(f"❌ Erreur initialisation PersistenceService: {e}")
-else:
-    logger.warning("⚠️ PersistenceService non disponible")
 
 safety = None
 if SafetyAIService is not None:
@@ -124,10 +145,8 @@ if SafetyAIService is not None:
         logger.info("✅ SafetyAIService initialisé")
     except Exception as e:
         logger.error(f"❌ Erreur initialisation SafetyAIService: {e}")
-else:
-    logger.warning("⚠️ SafetyAIService non disponible")
 
-MODEL_PATH = os.getenv("MODEL_PATH", None)
+MODEL_PATH         = os.getenv("MODEL_PATH", None)
 prediction_service = None
 if MODEL_PATH and os.path.exists(MODEL_PATH) and TrafficPredictionService:
     try:
@@ -143,27 +162,33 @@ if SumoEngineService is not None:
         logger.info("✅ SumoEngineService initialisé")
     except Exception as e:
         logger.error(f"❌ Erreur initialisation SumoEngineService: {e}")
-else:
-    logger.warning("⚠️ SumoEngineService non disponible")
+
+# ── LSTM services ──────────────────────────────────────────────────────────
+lstm_predictor = LSTMPredictorService() if LSTMPredictorService else None
+lstm_training  = False
+if lstm_predictor:
+    logger.info("✅ LSTMPredictorService initialisé")
+
+# ── Queue métriques (non-bloquant) ──────────────────────────────────────────
+# La boucle broadcast pousse ici, un worker séparé écrit en MongoDB
+_metrics_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
 
 # ============================================================
-# 4. SUMO CONFIG + JOURNEY STATE
+# 4. SUMO CONFIG + ÉTAT GLOBAL
 # ============================================================
-SUMO_RUNNING     = False
-SUMO_STEP_DELAY  = 0.0   # délai entre steps (0 = max vitesse)
-SUMO_EXTRA_STEPS = 0     # steps supplémentaires par tick (×2=1, ×5=4)
+SUMO_RUNNING      = False
+SUMO_STEP_DELAY   = 0.0
+SUMO_EXTRA_STEPS  = 0
 SUMO_ORIGINAL_CWD = os.getcwd()
 
-# Accidents : {vehicle_id: {"lat": ..., "lng": ..., "cause": ..., "blocked": []}}
-ACCIDENT_STATES: dict = {}
-
-# Détection pannes : {vehicle_id: {"waiting_since": step, "lat":..., "lng":..., "notified": bool}}
+ACCIDENT_STATES: dict  = {}
 BREAKDOWN_STATES: dict = {}
-BREAKDOWN_THRESHOLD = 40   # steps à l'arrêt hors feu = ~20s simulées → panne
+BREAKDOWN_THRESHOLD    = 40
+SUMO_PAUSED            = False   # True = boucle tourne mais SUMO ne step plus
 
-# Journey actif géré par la boucle broadcast
-ACTIVE_JOURNEY_ID = None       # ID du journey en cours
-ACTIVE_JOURNEY_SID = None      # SID socket du client (optionnel)
+# FIX B + FIX D : toujours initialisé à None
+ACTIVE_JOURNEY_ID  = None
+ACTIVE_JOURNEY_SID = None
 
 SUMO_DATA_DIR = os.getenv("SUMO_DATA_DIR", "/app/maps")
 if not os.path.exists(SUMO_DATA_DIR):
@@ -186,7 +211,6 @@ SUMO_CONFIG_FILE = os.getenv("SUMO_CONFIG_FILE", "casa.sumocfg")
 logger.info(f"📁 SUMO data directory: {SUMO_DATA_DIR}")
 logger.info(f"📄 SUMO config file: {SUMO_CONFIG_FILE}")
 
-# Instanciation du service de génération
 generate_service = None
 if GenerateService is not None:
     try:
@@ -194,10 +218,7 @@ if GenerateService is not None:
         logger.info("✅ GenerateService initialisé")
     except Exception as e:
         logger.error(f"❌ Erreur initialisation GenerateService: {e}")
-else:
-    logger.warning("⚠️ GenerateService non disponible")
 
-# Instanciation du service de configuration de scénario
 scenario_config = None
 if ScenarioConfigService is not None:
     try:
@@ -205,8 +226,6 @@ if ScenarioConfigService is not None:
         logger.info(f"✅ ScenarioConfigService initialisé — actif: {scenario_config.get_active_scenario_id() or 'défaut'}")
     except Exception as e:
         logger.error(f"❌ Erreur initialisation ScenarioConfigService: {e}")
-else:
-    logger.warning("⚠️ ScenarioConfigService non disponible")
 
 # ============================================================
 # 5. BROADCAST HELPERS
@@ -214,27 +233,31 @@ else:
 
 async def broadcast_all_vehicles() -> dict:
     """
-    Avance SUMO, émet all_vehicles_state et retourne le snapshot.
-    Retourne toujours un dict (vide si SUMO non connecté).
+    Avance SUMO d'un step, émet all_vehicles_state.
+    Retourne toujours un dict (jamais None).
     """
     try:
         if not traci.isLoaded():
             return {}
 
-        vehicles = traci.vehicle.getIDList()
-        snapshot = {}
+        vehicles   = traci.vehicle.getIDList()
+        snapshot   = {}
+        pedestrians = {}
 
         for vid in vehicles:
             try:
-                # Appliquer speedFactor aux nouveaux véhicules
-                if not hasattr(broadcast_all_vehicles, "_known") :
+                is_accident = vid.startswith("accident_")
+
+                if not hasattr(broadcast_all_vehicles, "_known"):
                     broadcast_all_vehicles._known = set()
                 if vid not in broadcast_all_vehicles._known:
                     broadcast_all_vehicles._known.add(vid)
-                    try:
-                        traci.vehicle.setSpeedFactor(vid, 1.2)
-                    except Exception:
-                        pass
+                    if not is_accident:
+                        try:
+                            traci.vehicle.setSpeedFactor(vid, 1.2)
+                        except Exception:
+                            pass
+
                 x, y = traci.vehicle.getPosition(vid)
                 try:
                     lon, lat = traci.simulation.convertGeo(x, y)
@@ -251,8 +274,7 @@ async def broadcast_all_vehicles() -> dict:
             except Exception:
                 continue
 
-        # ── Piétons (persons SUMO) ──────────────────────────────────
-        pedestrians = {}
+        # Piétons
         try:
             for pid in traci.person.getIDList():
                 try:
@@ -271,18 +293,20 @@ async def broadcast_all_vehicles() -> dict:
                 except Exception:
                     continue
         except Exception:
-            pass  # traci.person non disponible (réseau sans piétons)
+            pass
 
-        await sio.emit("all_vehicles_state", {"vehicles": snapshot, "pedestrians": pedestrians})
-        return snapshot                          # ← toujours retourné
+        await sio.emit("all_vehicles_state", {
+            "vehicles":   snapshot,
+            "pedestrians": pedestrians,
+        })
+        return snapshot
 
     except Exception as e:
         logger.warning(f"broadcast_all_vehicles error: {e}")
-        return {}                               # ← jamais None
+        return {}
 
 
 async def broadcast_nearby_vehicles(ego_id: str, sid: str):
-    """Émet les véhicules proches de l'ego à un client spécifique."""
     try:
         if not traci.isLoaded():
             return
@@ -299,17 +323,14 @@ async def broadcast_nearby_vehicles(ego_id: str, sid: str):
             try:
                 v_edge  = traci.vehicle.getRoadID(vid)
                 v_route = set(traci.vehicle.getRoute(vid))
-
                 if v_edge != ego_edge and len(ego_route & v_route) == 0:
                     continue
-
                 x, y = traci.vehicle.getPosition(vid)
                 try:
                     lon, lat = traci.simulation.convertGeo(x, y)
                 except Exception:
                     lat = 33.5731 + (y / 111320)
                     lon = -7.5898 + (x / 111320)
-
                 nearby[vid] = {
                     "lat":     lat,
                     "lng":     lon,
@@ -320,78 +341,114 @@ async def broadcast_nearby_vehicles(ego_id: str, sid: str):
                 continue
 
         await sio.emit("nearby_vehicles", {"vehicles": nearby}, room=sid)
-
     except Exception as e:
         logger.warning(f"broadcast_nearby_vehicles error: {e}")
 
 
 # ============================================================
-# 6. BOUCLE DE BROADCAST INDÉPENDANTE
+# 6. BOUCLE DE BROADCAST
 # ============================================================
 
+async def _metrics_writer():
+    """
+    Worker séparé qui consomme la queue de métriques et écrit en MongoDB.
+    Tourne en arrière-plan sans jamais bloquer la boucle broadcast.
+    Traite par batch de 50 pour réduire les round-trips MongoDB.
+    """
+    logger.info("📊 Worker métriques démarré")
+    batch = []
+    while True:
+        try:
+            # Attendre un élément (timeout 2s pour flush le batch partiel)
+            try:
+                item = await asyncio.wait_for(_metrics_queue.get(), timeout=2.0)
+                batch.append(item)
+                # Drainer le reste disponible immédiatement (sans attente)
+                while not _metrics_queue.empty() and len(batch) < 50:
+                    batch.append(_metrics_queue.get_nowait())
+            except asyncio.TimeoutError:
+                pass  # Flush le batch partiel
+
+            if batch and persistence:
+                for metric in batch:
+                    try:
+                        await persistence.save_traffic_metrics(metric)
+                    except Exception as e:
+                        logger.debug(f"metrics write error: {e}")
+                batch.clear()
+        except Exception as e:
+            logger.debug(f"_metrics_writer error: {e}")
+            await asyncio.sleep(1)
+
+
 async def simulation_broadcast_loop():
-    """
-    Tâche de fond principale :
-    - Avance SUMO d'un step
-    - Broadcast tous les véhicules (MapGlobal / MapSolo)
-    - Persiste les données du journey actif en MongoDB
-    - Détecte les anomalies et émet les alertes
-    """
     global SUMO_RUNNING, ACTIVE_JOURNEY_ID
     logger.info("🔄 Boucle broadcast démarrée")
-
     step_counter = 0
 
     while True:
         if SUMO_RUNNING:
             try:
-                # Guard : SUMO peut être fermé entre deux itérations
                 if not traci.isLoaded():
-                    logger.warning("simulation_broadcast_loop: TraCI non connecté, pause.")
+                    logger.warning("simulation_broadcast_loop: TraCI non connecté, arrêt.")
                     SUMO_RUNNING = False
                     BREAKDOWN_STATES.clear()
                     await sio.emit("simulation_status", {"status": "stopped"})
                     await asyncio.sleep(0.1)
                     continue
 
-                # Steps supplémentaires pour accélération ×2 ×5
+                # ── PAUSE : on diffuse l'état mais SUMO ne step pas ──────────
+                if SUMO_PAUSED:
+                    snapshot = await broadcast_all_vehicles()
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Steps SUMO (accélération ×2 ×5)
                 for _ in range(SUMO_EXTRA_STEPS):
                     traci.simulationStep()
                 traci.simulationStep()
                 step_counter += 1
 
-                # snapshot est TOUJOURS défini avant d'être utilisé
-                snapshot = await broadcast_all_vehicles()   # retourne dict {vid: {...}}
+                # Broadcast toujours défini
+                snapshot = await broadcast_all_vehicles()
                 vehicles = list(snapshot.keys())
 
-                # ── ACCIDENTS : détection véhicules bloqués ──────────────────
+                # ── ACCIDENTS : mise à jour positions + véhicules bloqués (1/step)
                 if ACCIDENT_STATES and step_counter % 5 == 0:
                     try:
                         acc_update = []
                         for acc_id, acc_info in ACCIDENT_STATES.items():
                             acc_edge = acc_info.get("edge", "")
-                            blocked = []
-                            for vid in vehicles:
-                                if vid == acc_id or vid.startswith("accident_"):
-                                    continue
+                            blocked  = []
+
+                            # Essayer de récupérer la position GPS si pas encore connue
+                            # FIX : vérifier que le véhicule est dans la sim avant tout appel TraCI
+                            if acc_info.get("lat") is None and acc_id in traci.vehicle.getIDList():
                                 try:
-                                    v_edge = traci.vehicle.getRoadID(vid)
-                                    v_speed = traci.vehicle.getSpeed(vid)
-                                    v_wait  = traci.vehicle.getWaitingTime(vid)
-                                    # Bloqué = même edge OU vitesse < 2 km/h depuis >5s
-                                    if v_edge == acc_edge and (v_speed < 0.5 or v_wait > 5):
-                                        blocked.append(vid)
+                                    x, y = traci.vehicle.getPosition(acc_id)
+                                    lon, lat = traci.simulation.convertGeo(x, y)
+                                    ACCIDENT_STATES[acc_id]["lat"]  = lat
+                                    ACCIDENT_STATES[acc_id]["lng"]  = lon
+                                    ACCIDENT_STATES[acc_id]["edge"] = traci.vehicle.getRoadID(acc_id)
+                                    logger.info(f"📍 Accident {acc_id} localisé : {lat:.5f},{lon:.5f}")
                                 except Exception:
-                                    continue
+                                    pass
+
+                            # Véhicules bloqués — seulement si l'accident est localisé
+                            if acc_info.get("edge"):
+                                for vid in vehicles:
+                                    if vid == acc_id or vid.startswith("accident_"):
+                                        continue
+                                    try:
+                                        v_edge = traci.vehicle.getRoadID(vid)
+                                        v_speed = traci.vehicle.getSpeed(vid)
+                                        v_wait  = traci.vehicle.getWaitingTime(vid)
+                                        if v_edge == acc_edge and (v_speed < 0.5 or v_wait > 5):
+                                            blocked.append(vid)
+                                    except Exception:
+                                        continue
+
                             ACCIDENT_STATES[acc_id]["blocked"] = blocked
-                            # Mettre à jour la position GPS (le véhicule peut légèrement dériver)
-                            try:
-                                x, y = traci.vehicle.getPosition(acc_id)
-                                lon, lat = traci.simulation.convertGeo(x, y)
-                                ACCIDENT_STATES[acc_id]["lat"] = lat
-                                ACCIDENT_STATES[acc_id]["lng"] = lon
-                            except Exception:
-                                pass
                             acc_update.append({
                                 "id":            acc_id,
                                 "lat":           acc_info.get("lat"),
@@ -401,30 +458,30 @@ async def simulation_broadcast_loop():
                                 "blocked_count": len(blocked),
                                 "blocked_ids":   blocked[:5],
                             })
+
+                        # Émettre tous les accidents (y compris sans GPS pour l'instant)
                         if acc_update:
                             await sio.emit("accidents_state", {"accidents": acc_update})
                     except Exception as acc_err:
                         logger.debug(f"accident update error: {acc_err}")
 
-                # ── PANNES : véhicules bloqués hors feu rouge ────────────────
+                # ── PANNES : véhicules bloqués hors feu rouge ─────────────
                 if step_counter % 3 == 0:
                     try:
-                        _all_vids = list(snapshot.keys())
-                        for _vid in _all_vids:
+                        for _vid in list(snapshot.keys()):
                             if _vid.startswith("accident_"):
                                 continue
                             _v   = snapshot[_vid]
                             _spd = _v.get("speed", 999)
 
                             if _spd <= 0.5:
-                                # Vérifier si c'est un feu rouge
                                 _at_tls = False
                                 try:
                                     _next_tls = traci.vehicle.getNextTLS(_vid)
-                                    # Si un feu est à < 15m et rouge/jaune → pas une panne
                                     if _next_tls:
-                                        _dist_tls, _state = _next_tls[0][2], _next_tls[0][3]
-                                        if _dist_tls < 15 and _state.lower() in ("r","y","u"):
+                                        _dist_tls = _next_tls[0][2]
+                                        _state    = _next_tls[0][3]
+                                        if _dist_tls < 15 and _state.lower() in ("r", "y", "u"):
                                             _at_tls = True
                                 except Exception:
                                     pass
@@ -433,13 +490,13 @@ async def simulation_broadcast_loop():
                                     if _vid not in BREAKDOWN_STATES:
                                         BREAKDOWN_STATES[_vid] = {
                                             "waiting_since": step_counter,
-                                            "lat": _v["lat"], "lng": _v["lng"],
-                                            "notified": False,
+                                            "lat":           _v["lat"],
+                                            "lng":           _v["lng"],
+                                            "notified":      False,
                                         }
                                     elif not BREAKDOWN_STATES[_vid]["notified"]:
                                         waited = step_counter - BREAKDOWN_STATES[_vid]["waiting_since"]
                                         if waited >= BREAKDOWN_THRESHOLD:
-                                            # Émettre alerte panne
                                             BREAKDOWN_STATES[_vid]["notified"] = True
                                             await sio.emit("emergency_alert", {
                                                 "vehicle_id": _vid,
@@ -454,15 +511,15 @@ async def simulation_broadcast_loop():
                                             })
                                             logger.info(f"🔧 Panne : {_vid} bloqué {waited} steps")
                             else:
-                                # Véhicule repart → effacer son état
                                 if _vid in BREAKDOWN_STATES:
                                     del BREAKDOWN_STATES[_vid]
                     except Exception as _bd_err:
                         logger.debug(f"breakdown detect: {_bd_err}")
 
-                # ── PERSISTENCE : position ego ───────────────────────────────
+                # ── PERSISTENCE : position ego ────────────────────────────
+                # FIX C : guard ACTIVE_JOURNEY_ID is not None
                 if ACTIVE_JOURNEY_ID and persistence and sumo_engine:
-                    ego_id = sumo_engine.vehicle_id
+                    ego_id   = sumo_engine.vehicle_id
                     ego_data = snapshot.get(ego_id)
                     if ego_data:
                         try:
@@ -473,7 +530,8 @@ async def simulation_broadcast_loop():
                                 speed=ego_data["speed"],
                                 heading=ego_data["heading"],
                             )
-                            await persistence.save_step(ACTIVE_JOURNEY_ID, point)
+                            # Fire-and-forget → ne bloque pas la boucle broadcast
+                            asyncio.create_task(persistence.save_step(ACTIVE_JOURNEY_ID, point))
                             await sio.emit("vehicle_state", {
                                 "id":      ego_id,
                                 "lat":     ego_data["lat"],
@@ -484,31 +542,56 @@ async def simulation_broadcast_loop():
                         except Exception as ego_err:
                             logger.debug(f"ego persist error: {ego_err}")
 
-                # ── MÉTRIQUES + ANOMALIES (toutes les 10 steps) ─────────────
-                if step_counter % 10 == 0 and sumo_engine and ACTIVE_JOURNEY_ID and persistence:
+                # ── MÉTRIQUES + ANOMALIES (toutes les 10 steps) ──────────
+                # FIX C : guard ACTIVE_JOURNEY_ID
+                if step_counter % 20 == 0 and sumo_engine and ACTIVE_JOURNEY_ID:
                     try:
                         metrics = sumo_engine.collect_traffic_metrics()
                         for metric in metrics.values():
+                            # Push LSTM (synchrone, non bloquant)
+                            if lstm_predictor:
+                                lstm_predictor.push_metrics(metric.segment_id, {
+                                    "average_speed": metric.average_speed,
+                                    "vehicle_count": metric.vehicle_count,
+                                    "density":       metric.density,
+                                    "occupancy":     metric.occupancy,
+                                })
+                            # Détecter anomalies (synchrone, non bloquant)
                             anomaly = sumo_engine.detect_anomalies(metric)
                             if anomaly:
-                                await persistence.save_anomaly(ACTIVE_JOURNEY_ID, anomaly)
-                                await sio.emit("emergency_alert", {
-                                    "vehicle_id":      sumo_engine.vehicle_id,
-                                    "nearest_vehicle": None,
-                                    "distance":        None,
-                                    "segment_id":      anomaly.segment_id,
-                                    "severity":        anomaly.severity,
-                                    "deviation":       round(anomaly.deviation, 2),
-                                    "anomaly_score":   round(anomaly.anomaly_score, 2),
-                                    "title":           f"Anomalie trafic — {anomaly.segment_id[:12]}",
-                                    "message":         f"Déviation {anomaly.deviation:.1f}σ sur segment {anomaly.segment_id}",
-                                    "risk_level":      anomaly.severity,
-                                    "timestamp":       datetime.utcnow().isoformat(),
+                                asyncio.create_task(
+                                    persistence.save_anomaly(ACTIVE_JOURNEY_ID, anomaly)
+                                ) if persistence else None
+                                await sio.emit("road_alert", {
+                                    "segment_id":    anomaly.segment_id,
+                                    "severity":      anomaly.severity,
+                                    "deviation":     round(anomaly.deviation, 2),
+                                    "anomaly_score": round(anomaly.anomaly_score, 2),
+                                    "title":         f"Anomalie — {anomaly.segment_id[:12]}",
+                                    "message":       f"Déviation {anomaly.deviation:.1f}σ sur {anomaly.segment_id}",
+                                    "risk_level":    anomaly.severity,
+                                    "timestamp":     datetime.utcnow().isoformat(),
                                 })
+                            # Pousser TOUTES les métriques dans la queue → worker écrit en MongoDB
+                            # Non-bloquant : put_nowait ignore si queue pleine (pas de backpressure)
+                            try:
+                                _metrics_queue.put_nowait(metric)
+                            except asyncio.QueueFull:
+                                pass  # Queue pleine → on skip, pas de blocage
                     except Exception as metrics_err:
                         logger.debug(f"metrics error: {metrics_err}")
 
-                # ── PRÉDICTIONS (toutes les 60 steps) ───────────────────────
+                # ── PRÉDICTIONS LSTM (toutes les 30 steps) ───────────────
+                if step_counter % 30 == 0 and lstm_predictor and lstm_predictor.is_ready:
+                    try:
+                        lstm_preds = await lstm_predictor.predict_all(top_n=20)
+                        if lstm_preds:
+                            await sio.emit("lstm_predictions", {"predictions": lstm_preds})
+                    except Exception as _lp_err:
+                        logger.debug(f"lstm predict error: {_lp_err}")
+
+                # ── PRÉDICTIONS SMA (toutes les 60 steps) ────────────────────
+                # FIX C : guard ACTIVE_JOURNEY_ID
                 if step_counter % 60 == 0 and sumo_engine and ACTIVE_JOURNEY_ID and persistence:
                     try:
                         active_segments = list(sumo_engine.segment_metrics.keys())[:10]
@@ -529,24 +612,25 @@ async def simulation_broadcast_loop():
                     except Exception as pred_err:
                         logger.debug(f"prediction error: {pred_err}")
 
-                # ── SÉCURITÉ : détection collision sur ego ───────────────────
-                if safety and sumo_engine:
+                # ── SÉCURITÉ : détection collision ego (throttlé) ──────────────────────
+                # FIX : check_proximity_risk ne tourne que si journey actif
+                # Throttle 1/5 steps → évite assertion SUMO vNext >= vMin
+                if safety and sumo_engine and ACTIVE_JOURNEY_ID and step_counter % 20 == 0:
                     ego_id   = sumo_engine.vehicle_id
-                    ego_data = snapshot.get(ego_id)   # snapshot est garanti défini ici
+                    ego_data = snapshot.get(ego_id)
                     if ego_data:
                         try:
                             from src.models.trafficAiModels import GeoPoint as _GP
                             _pos = _GP(lat=ego_data["lat"], lng=ego_data["lng"])
                         except Exception:
                             _pos = None
-                        await safety.check_proximity_risk(ego_id, _pos)
+                        # Fire-and-forget → ne bloque pas la boucle
+                        asyncio.create_task(safety.check_proximity_risk(ego_id, _pos))
 
             except Exception as e:
                 err_str = str(e)
                 if "Connection closed" in err_str or "not connected" in err_str.lower():
-                    logger.warning(f"⚠️ SUMO fermé (fin de simulation) — arrêt propre")
-                    # Tentative de redémarrage automatique si des scénarios sont disponibles
-                    # Pour l'instant, arrêt propre
+                    logger.warning("⚠️ SUMO fermé (fin de simulation) — arrêt propre")
                 else:
                     logger.error(f"❌ simulation_broadcast_loop error: {e}")
                 SUMO_RUNNING = False
@@ -557,7 +641,8 @@ async def simulation_broadcast_loop():
                     pass
                 await sio.emit("simulation_status", {"status": "stopped", "reason": err_str[:80]})
 
-        await asyncio.sleep(0.1)  # 10 fps
+        await asyncio.sleep(0.05)  # 20fps → mouvement fluide comme SUMO-GUI
+
 
 # ============================================================
 # 7. STARTUP / SHUTDOWN
@@ -566,13 +651,10 @@ async def simulation_broadcast_loop():
 @fastapi_app.on_event("startup")
 async def startup_db_client():
     global db, client
-
-    # Vérification MongoDB
     if client is not None and db is not None:
         try:
             await db.list_collection_names()
             logger.info("✅ Connexion MongoDB vérifiée")
-
             if persistence:
                 try:
                     await persistence.create_indexes()
@@ -583,9 +665,9 @@ async def startup_db_client():
     else:
         logger.warning("⚠️ MongoDB non configuré")
 
-    # Démarrage de la boucle broadcast en tâche de fond
     asyncio.create_task(simulation_broadcast_loop())
-    logger.info("✅ Boucle broadcast planifiée")
+    asyncio.create_task(_metrics_writer())
+    logger.info("✅ Boucle broadcast + worker métriques planifiés")
 
 
 @fastapi_app.on_event("shutdown")
@@ -605,16 +687,17 @@ async def shutdown_event():
         client.close()
     logger.info("✅ Application arrêtée")
 
+
 # ============================================================
-# 8. HEALTH CHECK ENDPOINTS
+# 8. HEALTH CHECK
 # ============================================================
 
 @fastapi_app.get("/")
 async def root():
     return {
         "message": "TMT Traffic Control API",
-        "version": "2.0.0",
-        "status": "running",
+        "version": "2.1.0",
+        "status":  "running",
         "services": {
             "persistence": persistence is not None,
             "safety":      safety is not None,
@@ -623,6 +706,7 @@ async def root():
             "mongodb":     db is not None,
         }
     }
+
 
 @fastapi_app.get("/health")
 async def health_check():
@@ -633,13 +717,13 @@ async def health_check():
             mongodb_status = True
         except Exception:
             pass
-
     return {
         "status":      "healthy",
         "timestamp":   datetime.utcnow().isoformat(),
         "mongodb":     mongodb_status,
         "sumo_loaded": traci.isLoaded() if sumo_engine else False,
     }
+
 
 @fastapi_app.get("/status")
 async def status():
@@ -648,20 +732,20 @@ async def status():
         is_loaded = traci.isLoaded()
     except Exception:
         pass
-
     engine_stats = {}
     if sumo_engine is not None and SUMO_RUNNING:
         try:
             engine_stats = sumo_engine.get_traffic_statistics()
         except Exception as e:
             logger.error(f"Erreur stats: {e}")
-
     return {
-        "sumo_running": SUMO_RUNNING,
-        "sumo_loaded":  is_loaded,
-        "ai_enabled":   prediction_service is not None,
-        "engine_stats": engine_stats,
+        "sumo_running":      SUMO_RUNNING,
+        "sumo_loaded":       is_loaded,
+        "ai_enabled":        prediction_service is not None,
+        "active_journey_id": ACTIVE_JOURNEY_ID,
+        "engine_stats":      engine_stats,
     }
+
 
 # ============================================================
 # 9. SIMULATION ENDPOINTS
@@ -669,23 +753,39 @@ async def status():
 
 @fastapi_app.post("/simulation/start")
 async def start_simulation():
-    global SUMO_RUNNING, SUMO_ORIGINAL_CWD
+    # FIX B : déclarer ACTIVE_JOURNEY_ID global et le remettre à None
+    global SUMO_RUNNING, SUMO_ORIGINAL_CWD, ACTIVE_JOURNEY_ID, SUMO_PAUSED
 
     logger.info(f"Starting SUMO at {datetime.now()}")
 
     if sumo_engine is None:
         raise HTTPException(status_code=500, detail="SumoEngineService non disponible")
 
+    # FIX B : reset du journey pour éviter pollution entre sessions
+    ACTIVE_JOURNEY_ID = None
+
     # Fermer l'instance précédente si nécessaire
     try:
         if traci.isLoaded():
             traci.close()
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
     except Exception as e:
         logger.warning(f"Cleanup error: {e}")
+    # FIX : forcer la fermeture de toute connexion TraCI résiduelle
+    try:
+        import traci.connection as _tc
+        for label in list(traci._connections.keys()):
+            try:
+                traci.switch(label)
+                traci.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
 
     try:
-        # ── Résolution du chemin via ScenarioConfigService ──
+        # Résolution du chemin via ScenarioConfigService
         if scenario_config is not None:
             validation = scenario_config.validate()
             active_dir = scenario_config.get_active_dir()
@@ -698,7 +798,6 @@ async def start_simulation():
             route_file  = scenario_config.get_rou_path()
             logger.info(f"Scénario actif : {scenario_config.get_active_scenario_id() or 'défaut'}")
         else:
-            # Fallback legacy
             config_path = os.path.join(SUMO_DATA_DIR, SUMO_CONFIG_FILE)
             net_file    = os.path.join(SUMO_DATA_DIR, "casa.net.xml")
             route_file  = os.path.join(SUMO_DATA_DIR, "casa.rou.xml")
@@ -710,38 +809,38 @@ async def start_simulation():
         if not os.path.exists(route_file):
             raise FileNotFoundError(f"Route file not found: {route_file}")
 
-        # Le CWD doit être le dossier contenant les fichiers
         active_dir = os.path.dirname(config_path)
         logger.info(f"Using config : {config_path}")
 
-        # ── Patcher le sumocfg pour ignorer les erreurs de routes ──
+        # Patcher le sumocfg (uniquement pour les scénarios générés)
         if scenario_config is not None:
             scenario_config.patch_sumocfg(config_path)
 
-        # Sauvegarder le CWD AVANT tout chdir — os.getcwd() échoue si
-        # le dossier courant a été supprimé depuis le dernier chdir
         try:
             SUMO_ORIGINAL_CWD = os.getcwd()
         except FileNotFoundError:
             SUMO_ORIGINAL_CWD = os.path.dirname(os.path.abspath(__file__))
             logger.warning(f"CWD introuvable, fallback: {SUMO_ORIGINAL_CWD}")
+
         os.chdir(active_dir)
 
-        # Nom du fichier sumocfg (relatif au active_dir)
         cfg_name = os.path.basename(config_path)
+        # SUMO_GUI=1 dans docker-compose pour activer sumo-gui
+        sumo_binary = "sumo-gui" if os.getenv("SUMO_GUI", "0") == "1" else "sumo"
+        logger.info(f"Lancement SUMO : {sumo_binary}")
         traci.start([
-            "sumo",
-            "-c",                     cfg_name,
-            "--step-length",          "0.5",
-            "--default.speeddev",     "0.1",
-            "--time-to-teleport",     "60",    # téléporte plus vite les véhicules bloqués
+            sumo_binary,
+            "-c",                          cfg_name,
+            "--step-length",               "0.1",   # 0.1s = 10 positions/sec comme SUMO-GUI
+            "--default.speeddev",          "0.1",
+            "--time-to-teleport",          "30",    # 30s max bloqué → téléport rapide
             "--time-to-teleport.highways", "-1",
-            "--ignore-route-errors",  "true",
-            "--collision.action",     "warn",
-            "--end",                  "86400", # 24h — SUMO ne se ferme jamais avant qu'on le stop
+            "--ignore-route-errors",       "true",
+            "--collision.action",          "warn",  # warn = pas de téléport brutal
+            "--end",                       "86400",
             "--no-warnings",
             "--no-step-log",
-            "--error-log",            "/tmp/sumo_errors.log",
+            "--error-log",                 "/tmp/sumo_errors.log",
         ])
 
         await asyncio.sleep(2)
@@ -749,10 +848,9 @@ async def start_simulation():
         if not traci.isLoaded():
             raise Exception("SUMO failed to load")
 
-        # ── Lire les accidents depuis le .rou.xml AVANT le warm-up ──
-        # Les véhicules accident_* ont depart=5,7,9… ils n'entrent pas
-        # dans la simulation pendant les 3 premiers steps (1.5s simulées).
-        # On lit directement le fichier XML pour pré-charger leurs métadonnées.
+        # ── FIX A : lire les accidents PRINCIPAUX uniquement ────────────────
+        # Les véhicules "_b" (secondaires) sont exclus de _acc_expected
+        # pour que la condition _acc_seen >= _acc_expected soit correcte.
         global ACCIDENT_STATES
         ACCIDENT_STATES = {}
 
@@ -760,15 +858,14 @@ async def start_simulation():
             import xml.etree.ElementTree as _ET
             _rou_path = scenario_config.get_rou_path() if scenario_config else route_file
             _rou_tree = _ET.parse(_rou_path)
+
             for _veh in _rou_tree.getroot().findall(".//vehicle"):
                 _vid = _veh.get("id", "")
-                if not _vid.startswith("accident_"):
+                # FIX A : exclure les ID secondaires "_b"
+                if not _vid.startswith("accident_") or _vid.endswith("_b"):
                     continue
-                # Cause encodée dans l'ID : accident_<cause>_<N>
-                # ex: accident_collision_0, accident_panne_1
                 _parts = _vid.split("_")
                 _cause = _parts[1] if len(_parts) >= 3 else "inconnu"
-                # Trouver l'edge depuis la route
                 _route_id = _veh.get("route", "")
                 _edge = ""
                 for _r in _rou_tree.getroot().findall(".//route"):
@@ -776,25 +873,26 @@ async def start_simulation():
                         _edge = (_r.get("edges") or "").split()[0]
                         break
                 ACCIDENT_STATES[_vid] = {
-                    "id": _vid,
-                    "lat": None, "lng": None,    # GPS rempli après warm-up
-                    "cause": _cause, "blocked": [], "blocked_count": 0,
-                    "edge": _edge,
+                    "id":            _vid,
+                    "lat":           None,
+                    "lng":           None,
+                    "cause":         _cause,
+                    "blocked":       [],
+                    "blocked_count": 0,
+                    "edge":          _edge,
                 }
-            logger.info(f"📋 {len(ACCIDENT_STATES)} accident(s) lus depuis {_rou_path}")
+            logger.info(f"📋 {len(ACCIDENT_STATES)} accident(s) principaux lus depuis {_rou_path}")
         except Exception as _xml_err:
             logger.warning(f"Lecture .rou.xml accidents: {_xml_err}")
 
-        # ── Warm-up : avancer jusqu'à ce que les accidents entrent (max 60 steps) ──
-        # Les accidents ont depart=5+(i*2), donc le dernier entre à ~5+N*2 secondes.
-        # step-length=0.5s → max 60 steps = 30s simulées.
+        # ── Warm-up : attendre que les accidents principaux entrent ─────────
         _acc_expected = set(ACCIDENT_STATES.keys())
         _acc_seen     = set()
 
-        for _step in range(60):
+        for _step in range(150):  # 150 steps × 0.5s = 75s simulées → accidents depart≤15s
             traci.simulationStep()
             _vids = set(traci.vehicle.getIDList())
-            # Dès qu'un accident apparaît, récupérer sa position GPS
+
             for _vid in (_vids & _acc_expected) - _acc_seen:
                 _acc_seen.add(_vid)
                 try:
@@ -807,22 +905,37 @@ async def start_simulation():
                     ACCIDENT_STATES[_vid]["lat"]  = _lat
                     ACCIDENT_STATES[_vid]["lng"]  = _lon
                     ACCIDENT_STATES[_vid]["edge"] = traci.vehicle.getRoadID(_vid)
-                    logger.info(f"  ✅ Accident entré : {_vid} ({ACCIDENT_STATES[_vid]['cause']}) @ {_lat:.5f},{_lon:.5f}")
+                    logger.info(
+                        f"  ✅ Accident : {_vid} ({ACCIDENT_STATES[_vid]['cause']}) "
+                        f"@ {_lat:.5f},{_lon:.5f}"
+                    )
                 except Exception as _pe:
                     logger.warning(f"Position accident {_vid}: {_pe}")
-            # Sortir dès que tous les accidents attendus sont entrés
-            if _acc_seen >= _acc_expected and len(_acc_expected) > 0:
-                logger.info(f"Tous les accidents entrés après {_step + 1} steps")
-                break
-            # Sortir aussi si au moins 3 véhicules normaux sont présents (simulation active)
-            _normal = [v for v in _vids if not v.startswith("accident_")]
-            if _step >= 3 and not _acc_expected:
-                break  # pas d'accidents attendus → 3 steps suffisent
 
-        vehicles = traci.vehicle.getIDList()
-        logger.info(f"Vehicles in simulation: {vehicles}")
+            if _acc_seen >= _acc_expected and _acc_expected:
+                logger.info(f"Tous les accidents ({len(_acc_seen)}) entrés après {_step + 1} steps")
+                break
+
+            # Pour les scénarios sans accident, 5 steps suffisent
+            if _step >= 4 and not _acc_expected:
+                break
+
+        # Émettre l'état initial des accidents (avec GPS)
+        # FIX : émettre TOUS les accidents, même sans GPS (le frontend les ignorera
+        # s'ils n'ont pas de lat/lng, mais ceux qui en ont seront visibles)
+        acc_emit = [
+            {**info, "id": vid, "blocked_count": 0, "blocked_ids": []}
+            for vid, info in ACCIDENT_STATES.items()
+        ]
+        acc_with_gps = [a for a in acc_emit if a.get("lat") is not None]
+        if acc_emit:
+            await sio.emit("accidents_state", {"accidents": acc_emit})
+            logger.info(f"🚨 {len(acc_with_gps)}/{len(ACCIDENT_STATES)} accidents émis ({len(acc_with_gps)} avec GPS)")
+        if len(acc_with_gps) == 0 and ACCIDENT_STATES:
+            logger.warning("⚠️ Aucun accident avec GPS — depart trop tardif ou edge introuvable")
 
         # Appliquer speedFactor sur les véhicules normaux
+        vehicles = traci.vehicle.getIDList()
         for vid in vehicles:
             try:
                 if not vid.startswith("accident_"):
@@ -830,27 +943,16 @@ async def start_simulation():
             except Exception:
                 pass
 
-        # Émettre l'état initial des accidents (avec GPS rempli)
-        acc_with_gps = [
-            {**info, "id": vid, "blocked_count": 0, "blocked_ids": []}
-            for vid, info in ACCIDENT_STATES.items()
-            if info.get("lat") is not None
-        ]
-        if acc_with_gps:
-            await sio.emit("accidents_state", {"accidents": acc_with_gps})
-            logger.info(f"🚨 {len(acc_with_gps)}/{len(ACCIDENT_STATES)} accidents émis avec GPS")
-        elif ACCIDENT_STATES:
-            logger.warning(f"⚠️ {len(ACCIDENT_STATES)} accidents lus mais GPS non disponible (depart trop tardif ?)")
-
-        # Active la boucle broadcast
+        SUMO_PAUSED = False
         SUMO_RUNNING = True
-        logger.info("✅ SUMO started successfully")
+        logger.info("✅ SUMO démarré")
 
         await sio.emit("simulation_status", {"status": "started"})
         return {
             "message":    "SUMO démarré",
             "status":     "started",
             "vehicles":   list(vehicles),
+            "accidents":  list(ACCIDENT_STATES.keys()),
             "ai_enabled": prediction_service is not None,
         }
 
@@ -861,45 +963,40 @@ async def start_simulation():
                 os.chdir(SUMO_ORIGINAL_CWD)
         except Exception:
             pass
-        SUMO_RUNNING = False
+        SUMO_RUNNING      = False
+        ACTIVE_JOURNEY_ID = None   # FIX B
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @fastapi_app.post("/simulation/step-delay")
 async def set_step_delay(factor: int = Body(..., embed=True)):
-    """
-    Ajuste la vitesse de simulation.
-    factor=1 → vitesse normale, factor=2 → 2x plus vite, factor=5 → 5x plus vite.
-    """
-    global SUMO_STEP_DELAY
+    global SUMO_STEP_DELAY, SUMO_EXTRA_STEPS
     delays = {1: 0.1, 2: 0.0, 5: 0.0}
-    SUMO_STEP_DELAY = delays.get(factor, 0.0)
-
-    # En plus, injecter des steps SUMO supplémentaires pour les facteurs élevés
-    global SUMO_EXTRA_STEPS
-    extra = {1: 0, 2: 1, 5: 4}
+    extra  = {1: 0,   2: 1,   5: 4}
+    SUMO_STEP_DELAY  = delays.get(factor, 0.0)
     SUMO_EXTRA_STEPS = extra.get(factor, 0)
-
     logger.info(f"Vitesse simulation ×{factor} (delay={SUMO_STEP_DELAY}s, extra_steps={SUMO_EXTRA_STEPS})")
     return {"status": "ok", "factor": factor}
 
 
 @fastapi_app.post("/simulation/stop")
 async def stop_simulation():
+    # FIX D : déclarer ACTIVE_JOURNEY_ID global
     global SUMO_RUNNING, ACTIVE_JOURNEY_ID
 
-    # Désactiver la boucle en premier pour éviter les conflits traci
     SUMO_RUNNING = False
     await asyncio.sleep(0.2)
 
-    # Finaliser le journey actif avant de fermer
+    # Finaliser le journey avant de fermer
     if ACTIVE_JOURNEY_ID and persistence:
         try:
             await persistence.finalize_journey(ACTIVE_JOURNEY_ID)
-            logger.info(f"✅ Journey finalisé à l'arrêt: {ACTIVE_JOURNEY_ID}")
+            logger.info(f"✅ Journey finalisé : {ACTIVE_JOURNEY_ID}")
         except Exception as e:
             logger.warning(f"Erreur finalisation journey: {e}")
-        ACTIVE_JOURNEY_ID = None
+
+    # FIX D : reset APRÈS finalisation
+    ACTIVE_JOURNEY_ID = None
 
     try:
         traci.close()
@@ -919,8 +1016,62 @@ async def stop_simulation():
     except Exception:
         pass
 
+    BREAKDOWN_STATES.clear()
+    ACCIDENT_STATES.clear()
+
     await sio.emit("simulation_status", {"status": "stopped"})
     return {"message": "Simulation arrêtée", "status": "stopped"}
+
+
+@fastapi_app.post("/simulation/pause")
+async def pause_simulation():
+    """Met la simulation en pause — SUMO ne step plus, les véhicules restent visibles."""
+    global SUMO_PAUSED
+    if not SUMO_RUNNING:
+        raise HTTPException(status_code=400, detail="Simulation non démarrée")
+    SUMO_PAUSED = True
+    await sio.emit("simulation_status", {"status": "paused"})
+    logger.info("⏸️  Simulation en pause")
+    return {"status": "paused", "message": "Simulation en pause"}
+
+
+@fastapi_app.post("/simulation/resume")
+async def resume_simulation():
+    """Reprend la simulation après une pause."""
+    global SUMO_PAUSED
+    if not SUMO_RUNNING:
+        raise HTTPException(status_code=400, detail="Simulation non démarrée")
+    SUMO_PAUSED = False
+    await sio.emit("simulation_status", {"status": "resumed"})
+    logger.info("▶️  Simulation reprise")
+    return {"status": "running", "message": "Simulation reprise"}
+
+
+@fastapi_app.post("/lstm/train")
+async def train_lstm_endpoint():
+    global lstm_training
+    if LSTMTrainService is None:
+        raise HTTPException(status_code=503, detail="TensorFlow non disponible — installez tensorflow dans le container")
+    if lstm_training:
+        return {"status": "already_running", "message": "Entraînement déjà en cours"}
+    lstm_training = True
+    asyncio.create_task(_run_lstm_training())
+    return {"status": "started", "message": "Entraînement LSTM lancé"}
+
+async def _run_lstm_training():
+    global lstm_training
+    try:
+        service = LSTMTrainService(sio=sio, db=db)
+        await service.run()
+        if lstm_predictor:
+            lstm_predictor._load()
+            logger.info("✅ Modèle LSTM rechargé dans LSTMPredictorService")
+    except Exception as e:
+        logger.error(f"LSTM training error: {e}")
+        await sio.emit("lstm_train_status", {"status": "error", "message": str(e)})
+    finally:
+        lstm_training = False
+
 
 # ============================================================
 # 10. JOURNEY ENDPOINTS
@@ -928,10 +1079,6 @@ async def stop_simulation():
 
 @fastapi_app.post("/journey/start")
 async def rest_start_journey(request: Request):
-    """
-    Crée un journey en DB et active la persistence dans la boucle broadcast.
-    Appelé automatiquement par MapSolo 2s après le démarrage de la simulation.
-    """
     global ACTIVE_JOURNEY_ID
 
     if not SUMO_RUNNING:
@@ -947,7 +1094,6 @@ async def rest_start_journey(request: Request):
         except Exception:
             pass
 
-    # Body JSON optionnel
     try:
         payload = await request.json()
     except Exception:
@@ -961,14 +1107,18 @@ async def rest_start_journey(request: Request):
     if doc is None:
         raise HTTPException(status_code=500, detail="Erreur création journey en DB")
 
-    ACTIVE_JOURNEY_ID = journey_id          # ← Active la persistence dans la boucle
+    ACTIVE_JOURNEY_ID = journey_id
     logger.info(f"✅ Journey actif: {journey_id}")
 
-    # Créer le véhicule ego dans SUMO
     if sumo_engine and traci.isLoaded():
         sumo_engine.compute_and_set_route(origin, destination)
 
-    return {"journey_id": journey_id, "status": "created", "origin": origin, "destination": destination}
+    return {
+        "journey_id":  journey_id,
+        "status":      "created",
+        "origin":      origin,
+        "destination": destination,
+    }
 
 
 @fastapi_app.get("/journeys")
@@ -978,7 +1128,6 @@ async def get_journeys():
     journeys = []
     try:
         async for doc in db.journeys.find({}, {"_id": 0}).sort("start_time", -1).limit(50):
-            # Normaliser : finalize_journey sauvegarde "anomalies_detected"
             if "anomalies_detected" not in doc:
                 doc["anomalies_detected"] = 0
             journeys.append(doc)
@@ -996,7 +1145,6 @@ async def get_journey(journey_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Journey not found")
 
-    # Steps (positions GPS)
     steps = []
     try:
         async for s in db.traffic_logs.find(
@@ -1007,7 +1155,6 @@ async def get_journey(journey_id: str):
         logger.error(f"Erreur get_steps: {e}")
     doc["steps"] = steps
 
-    # Anomalies du journey
     anomalies = []
     try:
         async for a in db.anomalies.find(
@@ -1018,7 +1165,6 @@ async def get_journey(journey_id: str):
         logger.error(f"Erreur get_anomalies for journey: {e}")
     doc["anomalies"] = anomalies
 
-    # Prédictions du journey
     predictions = []
     try:
         async for p in db.predictions.find(
@@ -1031,6 +1177,7 @@ async def get_journey(journey_id: str):
 
     return doc
 
+
 # ============================================================
 # 11. TRAFFIC ENDPOINTS
 # ============================================================
@@ -1040,8 +1187,8 @@ async def get_traffic_statistics():
     if sumo_engine is None or not SUMO_RUNNING:
         return {"status": "simulation_not_running"}
     try:
-        stats = sumo_engine.get_traffic_statistics()
-        stats["status"]     = "active"
+        stats             = sumo_engine.get_traffic_statistics()
+        stats["status"]   = "active"
         stats["ai_enabled"] = prediction_service is not None
         return stats
     except Exception as e:
@@ -1078,10 +1225,10 @@ async def get_anomalies(limit: int = 100):
 async def get_ai_info():
     if prediction_service:
         return {
-            "enabled":              True,
-            "model_type":           "TrafficPredictionService",
-            "features":             ["time_features", "historical_data", "current_metrics"],
-            "prediction_horizons":  ["short", "medium", "long"],
+            "enabled":             True,
+            "model_type":          "TrafficPredictionService",
+            "features":            ["time_features", "historical_data", "current_metrics"],
+            "prediction_horizons": ["short", "medium", "long"],
         }
     return {
         "enabled":  False,
@@ -1096,19 +1243,12 @@ async def get_ai_info():
 
 @sio.on("start_journey")
 async def handle_start(sid, data):
-    """
-    Événement Socket.IO start_journey.
-    Délègue à l'endpoint REST /journey/start via ACTIVE_JOURNEY_ID.
-    La persistence est gérée par simulation_broadcast_loop.
-    """
     global ACTIVE_JOURNEY_ID
 
     if not SUMO_RUNNING:
-        await sio.emit(
-            "system_error",
-            {"msg": "Démarrez SUMO via le bouton Play d'abord."},
-            room=sid,
-        )
+        await sio.emit("system_error",
+                       {"msg": "Démarrez SUMO via le bouton Play d'abord."},
+                       room=sid)
         return
 
     if persistence is None:
@@ -1119,7 +1259,6 @@ async def handle_start(sid, data):
     destination = data.get("destination") or {"lat": 33.5785, "lng": -7.6185}
     journey_id  = f"trip_{int(datetime.now().timestamp())}"
 
-    # Finaliser l'éventuel journey précédent
     if ACTIVE_JOURNEY_ID:
         try:
             await persistence.finalize_journey(ACTIVE_JOURNEY_ID)
@@ -1139,35 +1278,27 @@ async def handle_start(sid, data):
 @sio.on("get_traffic_prediction")
 async def handle_prediction(sid, data):
     if prediction_service is None or sumo_engine is None:
-        await sio.emit("prediction_response", {"error": "AI predictions not available"}, room=sid)
+        await sio.emit("prediction_response",
+                       {"error": "AI predictions not available"}, room=sid)
         return
-
     segment_id = data.get("segment_id")
     if not segment_id:
         await sio.emit("prediction_response", {"error": "segment_id required"}, room=sid)
         return
-
     predictions = await sumo_engine.predict_traffic([segment_id])
     if predictions:
         pred = predictions[0]
         await sio.emit("prediction_response", pred.dict(), room=sid)
 
+
 # ============================================================
-# 13. ASGI APP
-# ============================================================
-# ============================================================
-# SCENARIO ENDPOINTS  (délèguent à GenerateService)
+# 13. SCENARIO ENDPOINTS
 # ============================================================
 
 @fastapi_app.post("/scenario/generate")
 async def scenario_generate(request: Request):
-    """
-    Génère un scénario SUMO complet depuis une bounding box OSM.
-    Délègue toute la logique à GenerateService.
-    """
     if generate_service is None:
         raise HTTPException(status_code=500, detail="GenerateService non disponible")
-
     try:
         body = await request.json()
     except Exception:
@@ -1178,8 +1309,8 @@ async def scenario_generate(request: Request):
     pedestrian_count = int(body.get("pedestrian_count", 20))
     accidents_list   = body.get("accidents",            [])
     sim_duration     = int(body.get("sim_duration",   3600))
+    scenario_name    = str(body.get("scenario_name",    "")).strip()
 
-    # Validations
     for key in ("min_lat", "max_lat", "min_lng", "max_lng"):
         if bbox.get(key) is None:
             raise HTTPException(status_code=400, detail=f"bbox.{key} requis")
@@ -1187,18 +1318,19 @@ async def scenario_generate(request: Request):
     dlat = abs(bbox["max_lat"] - bbox["min_lat"])
     dlng = abs(bbox["max_lng"] - bbox["min_lng"])
     if dlat < 0.001 or dlng < 0.001:
-        raise HTTPException(status_code=400, detail="Zone trop petite — agrandissez le rectangle sur la carte")
-
-    scenario_name = str(body.get("scenario_name", "")).strip()
+        raise HTTPException(
+            status_code=400,
+            detail="Zone trop petite — agrandissez le rectangle sur la carte"
+        )
 
     try:
         result = await generate_service.generate(
-            bbox             = bbox,
-            vehicle_count    = vehicle_count,
-            pedestrian_count = pedestrian_count,
-            accidents        = accidents_list,
-            sim_duration     = sim_duration,
-            scenario_name    = scenario_name,
+            bbox=bbox,
+            vehicle_count=vehicle_count,
+            pedestrian_count=pedestrian_count,
+            accidents=accidents_list,
+            sim_duration=sim_duration,
+            scenario_name=scenario_name,
         )
         return result
     except Exception as e:
@@ -1208,7 +1340,6 @@ async def scenario_generate(request: Request):
 
 @fastapi_app.get("/scenario/list")
 async def scenario_list():
-    """Liste tous les scénarios archivés avec marquage du scénario actif."""
     if scenario_config is not None:
         return {"scenarios": scenario_config.list_scenarios()}
     if generate_service is not None:
@@ -1218,7 +1349,6 @@ async def scenario_list():
 
 @fastapi_app.get("/scenario/config")
 async def scenario_get_config():
-    """Retourne la configuration du scénario actif (chemins, validation)."""
     if scenario_config is None:
         return {"error": "ScenarioConfigService non disponible"}
     info       = scenario_config.get_active_scenario_info()
@@ -1228,15 +1358,13 @@ async def scenario_get_config():
 
 @fastapi_app.post("/scenario/select/{scenario_id}")
 async def scenario_select(scenario_id: str):
-    """
-    Sélectionne un scénario sans copier les fichiers.
-    La simulation utilisera directement maps/<scenario_id>/.
-    """
     if scenario_config is None:
         raise HTTPException(status_code=500, detail="ScenarioConfigService non disponible")
     if SUMO_RUNNING:
-        raise HTTPException(status_code=400, detail="Arrêtez la simulation avant de changer de scénario")
-
+        raise HTTPException(
+            status_code=400,
+            detail="Arrêtez la simulation avant de changer de scénario"
+        )
     result = scenario_config.select_scenario(scenario_id)
     if not result["success"]:
         raise HTTPException(status_code=404, detail=result["message"])
@@ -1245,7 +1373,6 @@ async def scenario_select(scenario_id: str):
 
 @fastapi_app.post("/scenario/select-default")
 async def scenario_select_default():
-    """Revient aux fichiers par défaut de maps/."""
     if scenario_config is None:
         raise HTTPException(status_code=500, detail="ScenarioConfigService non disponible")
     if SUMO_RUNNING:
@@ -1255,15 +1382,13 @@ async def scenario_select_default():
 
 @fastapi_app.post("/scenario/fix-routes")
 async def scenario_fix_routes():
-    """
-    Regenere les routes valides depuis le casa.net.xml actif
-    en filtrant les edges piétons/cyclistes.
-    Patche aussi le casa.sumocfg pour ignorer les erreurs résiduelles.
-    """
     import shutil, tempfile
 
     if SUMO_RUNNING:
-        raise HTTPException(status_code=400, detail="Arretez la simulation avant de corriger les routes")
+        raise HTTPException(
+            status_code=400,
+            detail="Arrêtez la simulation avant de corriger les routes"
+        )
 
     if scenario_config is not None:
         net_file = scenario_config.get_net_path()
@@ -1277,7 +1402,6 @@ async def scenario_fix_routes():
     if not os.path.exists(net_file):
         raise HTTPException(status_code=404, detail=f"casa.net.xml introuvable : {net_file}")
 
-    # Patcher le sumocfg d'abord (ignore-route-errors)
     patched_cfg = False
     if scenario_config is not None and os.path.exists(cfg_file):
         patched_cfg = scenario_config.patch_sumocfg(cfg_file)
@@ -1289,8 +1413,7 @@ async def scenario_fix_routes():
         )
         import json as _json
 
-        # Lire les métadonnées pour récupérer le nb de véhicules d'origine
-        vehicle_count = 50  # défaut
+        vehicle_count = 50
         if scenario_config is not None:
             sc_id = scenario_config.get_active_scenario_id()
             if sc_id:
@@ -1300,7 +1423,6 @@ async def scenario_fix_routes():
                         with open(meta_path) as _f:
                             _meta = _json.load(_f)
                         vehicle_count = int(_meta.get("vehicle_count", 50))
-                        logger.info(f"fix-routes: {vehicle_count} véhicules depuis metadata")
                     except Exception:
                         pass
 
@@ -1317,7 +1439,6 @@ async def scenario_fix_routes():
                 if ok:
                     shutil.copy2(rou_tmp, rou_file)
                     size = os.path.getsize(rou_file)
-                    logger.info(f"Routes régénérées via randomTrips ({size} bytes, {vehicle_count} véhicules)")
                     return {
                         "status":        "fixed",
                         "method":        "randomTrips",
@@ -1328,11 +1449,8 @@ async def scenario_fix_routes():
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
-        # Fallback BFS
-        logger.info("randomTrips indisponible — BFS topologie réseau")
         _generate_minimal_routes(rou_file, net_file, count=vehicle_count)
         size = os.path.getsize(rou_file)
-        logger.info(f"Routes BFS générées ({size} bytes, {vehicle_count} véhicules)")
         return {
             "status":        "fixed",
             "method":        "bfs_topology",
@@ -1348,7 +1466,6 @@ async def scenario_fix_routes():
 
 @fastapi_app.get("/scenario/active")
 async def scenario_active():
-    """Retourne le scénario actif avec ses informations."""
     if scenario_config is not None:
         return {
             "active": scenario_config.get_active_scenario_id(),
@@ -1361,31 +1478,28 @@ async def scenario_active():
 
 @fastapi_app.delete("/scenario/{scenario_id}")
 async def scenario_delete(scenario_id: str):
-    """
-    Supprime définitivement un dossier de scénario archivé.
-    Interdit sur les fichiers par défaut (racine maps/).
-    """
     import shutil
 
     if SUMO_RUNNING:
-        raise HTTPException(status_code=400, detail="Arrêtez la simulation avant de supprimer un scénario")
+        raise HTTPException(
+            status_code=400,
+            detail="Arrêtez la simulation avant de supprimer un scénario"
+        )
 
-    # Sécurité : interdire la suppression de la racine maps/
     sc_dir = os.path.join(SUMO_DATA_DIR, scenario_id)
     if os.path.abspath(sc_dir) == os.path.abspath(SUMO_DATA_DIR):
-        raise HTTPException(status_code=403, detail="Impossible de supprimer les fichiers par défaut")
-
-    # Vérifier que c'est bien un sous-dossier de SUMO_DATA_DIR
+        raise HTTPException(
+            status_code=403,
+            detail="Impossible de supprimer les fichiers par défaut"
+        )
     if not sc_dir.startswith(os.path.abspath(SUMO_DATA_DIR)):
         raise HTTPException(status_code=403, detail="Chemin non autorisé")
-
     if not os.path.isdir(sc_dir):
         raise HTTPException(status_code=404, detail=f"Scénario introuvable : {scenario_id}")
 
-    # Si c'est le scénario actif, revenir au défaut
     if scenario_config is not None and scenario_config.get_active_scenario_id() == scenario_id:
         scenario_config.select_default()
-        logger.info(f"Scénario actif supprimé → retour au défaut")
+        logger.info("Scénario actif supprimé → retour au défaut")
 
     try:
         shutil.rmtree(sc_dir)
@@ -1397,12 +1511,11 @@ async def scenario_delete(scenario_id: str):
 
 @fastapi_app.post("/scenario/deploy/{scenario_id}")
 async def scenario_deploy(scenario_id: str):
-    """
-    Sélectionne un scénario (sans copier les fichiers).
-    Utilise ScenarioConfigService si disponible.
-    """
     if SUMO_RUNNING:
-        raise HTTPException(status_code=400, detail="Arrêtez la simulation avant de changer de scénario")
+        raise HTTPException(
+            status_code=400,
+            detail="Arrêtez la simulation avant de changer de scénario"
+        )
 
     if scenario_config is not None:
         result = scenario_config.select_scenario(scenario_id)
@@ -1410,7 +1523,6 @@ async def scenario_deploy(scenario_id: str):
             raise HTTPException(status_code=404, detail=result["message"])
         return {"status": "selected", "scenario_id": scenario_id, **result}
 
-    # Fallback legacy
     if generate_service is not None:
         ok = generate_service.deploy_scenario(scenario_id)
         if not ok:
@@ -1420,6 +1532,9 @@ async def scenario_deploy(scenario_id: str):
     raise HTTPException(status_code=500, detail="Aucun service de scénario disponible")
 
 
+# ============================================================
+# 14. ASGI APP
+# ============================================================
 app = socketio.ASGIApp(sio, fastapi_app)
 
 if __name__ == "__main__":
