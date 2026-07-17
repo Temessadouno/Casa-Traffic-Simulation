@@ -8,7 +8,7 @@
     "occupancy"
   ],
   "target": "average_speed",
-  "trained_at": "2026-06-22T16:39:02.811701",
-  "val_mae": 0.20000222325325012,
-  "n_samples": 5848
+  "trained_at": "2026-06-23T02:16:29.624198",
+  "val_mae": 0.04843369126319885,
+  "n_samples": 2964
 }

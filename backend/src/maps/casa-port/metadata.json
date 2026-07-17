@@ -1,0 +1,21 @@
+{
+  "scenario_id": "casa-port",
+  "generated_at": "2026-06-23T00:55:15.126346",
+  "bbox": {
+    "min_lat": 33.595456569433374,
+    "max_lat": 33.59660493367842,
+    "min_lng": -7.605462670326234,
+    "max_lng": -7.6012247800827035
+  },
+  "vehicle_count": 200,
+  "pedestrian_count": 50,
+  "accident_count": 2,
+  "sim_duration_s": 7200,
+  "network_method": "osm",
+  "deployed_files": [
+    "casa.net.xml",
+    "casa.rou.xml",
+    "casa.sumocfg"
+  ],
+  "scenario_name": "casa-port"
+}

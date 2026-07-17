@@ -1,0 +1,22 @@
+{
+  "scenario_id": "Casa",
+  "generated_at": "2026-06-23T06:16:03.525530",
+  "bbox": {
+    "min_lat": 33.59555427212986,
+    "max_lat": 33.59797162536869,
+    "min_lng": -7.61205554008484,
+    "max_lng": -7.60754406452179
+  },
+  "vehicle_count": 40,
+  "pedestrian_count": 20,
+  "accident_count": 2,
+  "sim_duration_s": 7200,
+  "network_method": "osm",
+  "deployed_files": [
+    "casa.net.xml",
+    "casa.rou.xml",
+    "casa.sumocfg"
+  ],
+  "scenario_name": "Casa",
+  "flow_progressive": true
+}
